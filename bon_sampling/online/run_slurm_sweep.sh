@@ -2,7 +2,7 @@
 #SBATCH --job-name=online_bon_sweep
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_normal
+#SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -55,7 +55,7 @@ echo "SLURM_ARRAY_TASK_ID = ${SLURM_ARRAY_TASK_ID}"
 echo "method = ${METHOD}, task_id = ${TASK_ID}"
 echo "train_steps = ${TRAIN_STEPS}, rounds = ${ROUNDS}"
 
-run_name="${METHOD}_task${TASK_ID}_steps${TRAIN_STEPS}_r${ROUNDS}"
+run_name="${METHOD}_task${TASK_ID}"
 safe_run_name="${run_name//\//_}"
 
 echo "Launching ${run_name}"

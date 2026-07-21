@@ -193,6 +193,7 @@ def main():
     )
 
     reranker_ckpt = None
+    iql_agent = None
     train_paths: list[Path] = []
     tmp_dir = Path(tempfile.mkdtemp(prefix='bon_reranker_'))
     reranker_path = tmp_dir / 'reranker.pkl'
@@ -234,9 +235,10 @@ def main():
                 train_paths.append(raw_path)
                 from bon_sampling.iql.train import train_iql
 
-                ckpt_path, metrics = train_iql(
+                ckpt_path, metrics, iql_agent = train_iql(
                     train_paths, reranker_path, args.train_steps, seed=args.seed,
                     batch_size=args.batch_size, chunk_size=chunk_size, expectile=args.expectile,
+                    init_agent=iql_agent,
                 )
 
             log['train/num_datasets'] = len(train_paths)

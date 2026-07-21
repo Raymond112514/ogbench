@@ -72,37 +72,46 @@ def train_iql(
     batch_size: int | None = None,
     chunk_size: int = 4,
     expectile: float = 0.9,
-) -> tuple[str, dict]:
+    init_agent: IQLAgent | None = None,
+) -> tuple[str, dict, IQLAgent]:
+    """Fit IQL on data_paths. If init_agent is given, continue from it (Adam state carries over)."""
     dataset = IQLDataset.from_paths(data_paths)
     if dataset.size == 0:
         raise ValueError('IQL dataset is empty')
 
-    config = get_config()
-    if batch_size is not None:
-        config.batch_size = batch_size
-    config.expectile = expectile
-
     obs_dim = dataset.data['observations'].shape[1]
     act_dim = dataset.data['actions'].shape[1]
-    agent = IQLAgent.create(
-        seed=seed,
-        ex_observations=dataset.data['observations'][:1],
-        ex_actions=dataset.data['actions'][:1],
-        config=config,
-    )
 
+    if init_agent is None:
+        config = get_config()
+        if batch_size is not None:
+            config.batch_size = batch_size
+        config.expectile = expectile
+        agent = IQLAgent.create(
+            seed=seed,
+            ex_observations=dataset.data['observations'][:1],
+            ex_actions=dataset.data['actions'][:1],
+            config=config,
+        )
+        prev_steps = 0
+    else:
+        agent = init_agent
+        prev_steps = int(agent.network.step) - 1
+
+    bs = batch_size if batch_size is not None else int(agent.config['batch_size'])
     rng = np.random.default_rng(seed)
     info = {}
     for step in trange(1, steps + 1, desc='train iql'):
-        batch = {k: jnp.asarray(v) for k, v in dataset.sample(config.batch_size, rng).items()}
+        batch = {k: jnp.asarray(v) for k, v in dataset.sample(bs, rng).items()}
         agent, info = agent.update(batch)
 
     # Temp file for BoN workers only (overwritten each round; not archived).
-    save_iql(str(ckpt_path), agent, obs_dim, act_dim, chunk_size, steps)
-    metrics = {}
+    total_steps = prev_steps + steps
+    save_iql(str(ckpt_path), agent, obs_dim, act_dim, chunk_size, total_steps)
+    metrics = {'total_steps': float(total_steps)}
     for k, v in info.items():
         try:
             metrics[k] = float(v)
         except (TypeError, ValueError):
             pass
-    return str(ckpt_path), metrics
+    return str(ckpt_path), metrics, agent
