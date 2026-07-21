@@ -94,23 +94,83 @@ class IQLDataset:
         return cls(merge_transitions([transitions_from_rollouts(p) for p in paths]))
 
     @classmethod
-    def from_ogbench(cls, train_dataset: dict, action_clip_eps: float = 1e-5):
-        """Build from OGBench/FQL singletask dataset dict (same data FQL uses)."""
+    def from_ogbench(cls, train_dataset: dict, action_clip_eps: float = 1e-5, chunk_size: int = 1):
+        """Build from OGBench/FQL singletask dataset dict (same data FQL uses).
+
+        chunk_size=1: single-step actions (FQL default).
+        chunk_size>1: pack consecutive actions within an episode into a flat chunk;
+          reward is 0 if any step in the chunk has success (r=0), else -1;
+          mask is 0 on success, else 1.
+        """
         keys = ('observations', 'actions', 'next_observations', 'rewards', 'masks')
         for k in keys:
             if k not in train_dataset:
                 raise ValueError(f'OGBench dataset missing key {k!r}')
+        if chunk_size < 1:
+            raise ValueError(f'chunk_size must be >= 1, got {chunk_size}')
+
+        observations = np.asarray(train_dataset['observations'], np.float32)
         actions = np.asarray(train_dataset['actions'], np.float32)
+        next_observations = np.asarray(train_dataset['next_observations'], np.float32)
+        rewards = np.asarray(train_dataset['rewards'], np.float32).reshape(-1)
+        masks = np.asarray(train_dataset['masks'], np.float32).reshape(-1)
         if action_clip_eps is not None:
             actions = np.clip(actions, -1.0 + action_clip_eps, 1.0 - action_clip_eps)
-        data = {
-            'observations': np.asarray(train_dataset['observations'], np.float32),
-            'actions': actions,
-            'next_observations': np.asarray(train_dataset['next_observations'], np.float32),
-            'rewards': np.asarray(train_dataset['rewards'], np.float32).reshape(-1),
-            'masks': np.asarray(train_dataset['masks'], np.float32).reshape(-1),
-        }
-        return cls(data)
+
+        if chunk_size == 1:
+            return cls(
+                dict(
+                    observations=observations,
+                    actions=actions,
+                    next_observations=next_observations,
+                    rewards=rewards,
+                    masks=masks,
+                )
+            )
+
+        if 'terminals' not in train_dataset:
+            raise ValueError('chunk_size>1 requires terminals to respect episode boundaries')
+        terminals = np.asarray(train_dataset['terminals']).reshape(-1)
+        # Episode ends are exclusive indices after each terminal transition.
+        ends = (np.where(terminals > 0.5)[0] + 1).tolist()
+        if not ends or ends[-1] != len(observations):
+            # Fallback: treat whole dataset as one trajectory if terminals are missing/odd.
+            ends = ends + ([len(observations)] if not ends or ends[-1] < len(observations) else [])
+
+        act_dim = actions.shape[-1]
+        # Success at a step: OGBench cube reward is 0 on success, -1 otherwise (mask 0 on success).
+        successes = (rewards > -0.5) | (masks < 0.5)
+
+        obs_list, act_list, next_list, rew_list, mask_list = [], [], [], [], []
+        start = 0
+        for end in ends:
+            t = start
+            while t < end:
+                chunk_end = min(t + chunk_size, end)
+                chunk = np.zeros((chunk_size, act_dim), np.float32)
+                chunk[: chunk_end - t] = actions[t:chunk_end]
+                success = bool(np.any(successes[t:chunk_end]))
+                if chunk_end < end:
+                    next_obs = observations[chunk_end]
+                else:
+                    next_obs = next_observations[chunk_end - 1]
+                obs_list.append(observations[t])
+                act_list.append(chunk.reshape(-1))
+                next_list.append(next_obs)
+                rew_list.append(0.0 if success else -1.0)
+                mask_list.append(0.0 if success else 1.0)
+                t = chunk_end
+            start = end
+
+        return cls(
+            dict(
+                observations=np.asarray(obs_list, np.float32),
+                actions=np.asarray(act_list, np.float32),
+                next_observations=np.asarray(next_list, np.float32),
+                rewards=np.asarray(rew_list, np.float32),
+                masks=np.asarray(mask_list, np.float32),
+            )
+        )
 
     def subsample(self, percent: float, seed: int = 0) -> 'IQLDataset':
         """Keep a random `percent`% of transitions (1–100). Deterministic given seed."""

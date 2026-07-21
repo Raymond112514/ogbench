@@ -32,6 +32,7 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-100000}"
 EVAL_EPISODES="${EVAL_EPISODES:-50}"
 ALPHA="${ALPHA:-10.0}"   # FQL IQL default
 EXPECTILE=0.9
+CHUNK_SIZE="${CHUNK_SIZE:-1}"   # 1 = single-step; 4 = action chunks
 WANDB_PROJECT="${WANDB_PROJECT:-awr-offline}"
 
 TASKS=(1 2)
@@ -43,12 +44,13 @@ ENV_NAME="cube-single-play-singletask-task${TASK_ID}-v0"
 mkdir -p "${REPO_DIR}/logs"
 cd "${REPO_DIR}"
 
-run_name="offline_iql_${ENV_NAME}_alpha${ALPHA}_data${DATA_PERCENT}pct_steps${TRAIN_STEPS}"
+run_name="offline_iql_${ENV_NAME}_alpha${ALPHA}_chunk${CHUNK_SIZE}_data${DATA_PERCENT}pct_steps${TRAIN_STEPS}"
 safe_run_name="${run_name//./p}"
 
 echo "SLURM_ARRAY_TASK_ID = ${SLURM_ARRAY_TASK_ID}"
 echo "env = ${ENV_NAME}"
 echo "alpha = ${ALPHA}"
+echo "chunk_size = ${CHUNK_SIZE}"
 echo "data_percent = ${DATA_PERCENT}"
 echo "Launching ${run_name}"
 
@@ -61,6 +63,7 @@ python awr/offline.py \
   --alpha "${ALPHA}" \
   --expectile "${EXPECTILE}" \
   --data_percent "${DATA_PERCENT}" \
+  --chunk_size "${CHUNK_SIZE}" \
   --device auto \
   --wandb_project "${WANDB_PROJECT}" \
   --wandb_name "${run_name}" \

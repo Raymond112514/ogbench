@@ -3,10 +3,12 @@
 No GCBC collection and no online fine-tuning — pure offline RL like FQL's IQL baseline:
 
   python awr/offline.py --env_name=cube-single-play-singletask-task1-v0 --alpha 10
-  python awr/offline.py --env_name=cube-single-play-singletask-task2-v0 --alpha 10 --data_percent 10
+  python awr/offline.py --env_name=cube-single-play-singletask-task1-v0 --chunk_size 4 --alpha 10
 
 Uses ogbench.make_env_and_datasets (downloads cube-single-play-v0 once; rewards are
 task-relabeled). Jointly trains V, Q, and the AWR actor every step.
+With --chunk_size 4, actions are packed into length-4 chunks; chunk reward is 0 if any
+of the 4 steps succeeds, else -1.
 """
 
 from __future__ import annotations
@@ -25,11 +27,12 @@ if sys.platform.startswith('linux'):
     os.environ.setdefault('MUJOCO_GL', 'egl')
 
 
-def evaluate_iql(agent, env, num_episodes: int, seed: int = 0) -> float:
-    """Eval success rate with the jointly trained IQL actor (single-step actions)."""
+def evaluate_iql(agent, env, num_episodes: int, seed: int = 0, chunk_size: int = 1) -> float:
+    """Eval success rate with the jointly trained IQL actor (optionally action-chunked)."""
     import jax
 
     key = jax.random.PRNGKey(seed)
+    act_dim = int(np.prod(env.action_space.shape))
     successes = []
     for _ in range(num_episodes):
         ob, info = env.reset()
@@ -37,10 +40,17 @@ def evaluate_iql(agent, env, num_episodes: int, seed: int = 0) -> float:
         success = float(info.get('success', 0.0))
         while not done:
             key, sample_key = jax.random.split(key)
-            action = np.array(agent.sample_actions(observations=ob, seed=sample_key, temperature=1.0))
-            ob, _, terminated, truncated, info = env.step(action.copy())
-            done = terminated or truncated
-            success = float(info.get('success', 0.0))
+            flat = np.array(agent.sample_actions(observations=ob, seed=sample_key, temperature=1.0))
+            if chunk_size <= 1:
+                actions = flat.reshape(1, -1)
+            else:
+                actions = flat.reshape(chunk_size, act_dim)
+            for a in actions:
+                if done:
+                    break
+                ob, _, terminated, truncated, info = env.step(np.asarray(a, np.float32).copy())
+                done = terminated or truncated
+                success = float(info.get('success', 0.0))
         successes.append(success)
     return float(np.mean(successes))
 
@@ -69,6 +79,12 @@ def main():
         default=100.0,
         help='Percent of OGBench training transitions to use (1–100; subsampled with --seed)',
     )
+    p.add_argument(
+        '--chunk_size',
+        type=int,
+        default=1,
+        help='Action chunk length (1 = single-step FQL default; 4 = pack 4 consecutive actions)',
+    )
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu')
     p.add_argument('--dataset_dir', default=None, help='Override OGBench dataset dir (default ~/.ogbench/data)')
     p.add_argument('--wandb_project', default='awr-offline')
@@ -78,6 +94,8 @@ def main():
 
     if not (0 < args.data_percent <= 100):
         p.error(f'--data_percent must be in (0, 100], got {args.data_percent}')
+    if args.chunk_size < 1:
+        p.error(f'--chunk_size must be >= 1, got {args.chunk_size}')
 
     if args.device == 'cpu':
         os.environ['JAX_PLATFORMS'] = 'cpu'
@@ -94,26 +112,33 @@ def main():
     if args.dataset_dir is not None:
         kwargs['dataset_dir'] = args.dataset_dir
 
-    print(f'loading OGBench dataset: {args.env_name}')
+    print(f'loading OGBench dataset: {args.env_name}  chunk_size={args.chunk_size}')
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(args.env_name, **kwargs)
-    dataset = IQLDataset.from_ogbench(train_dataset)
+    # Chunk first (needs consecutive episode order), then subsample chunks.
+    dataset = IQLDataset.from_ogbench(train_dataset, chunk_size=args.chunk_size)
     full_size = dataset.size
     dataset = dataset.subsample(args.data_percent, seed=args.seed)
     print(
         f'dataset size={dataset.size}/{full_size} ({args.data_percent:g}%)  '
-        f'obs={dataset.data["observations"].shape}  act={dataset.data["actions"].shape}'
+        f'obs={dataset.data["observations"].shape}  act={dataset.data["actions"].shape}  '
+        f'reward_mean={float(dataset.data["rewards"].mean()):.4f}'
     )
     wandb.log(
         {
             'dataset/size': dataset.size,
             'dataset/full_size': full_size,
             'dataset/data_percent': args.data_percent,
+            'dataset/chunk_size': args.chunk_size,
+            'dataset/action_dim': int(dataset.data['actions'].shape[-1]),
+            'dataset/reward_mean': float(dataset.data['rewards'].mean()),
         },
         step=0,
     )
 
     def eval_fn(agent, step):
-        sr = evaluate_iql(agent, env, args.eval_episodes, seed=args.seed)
+        sr = evaluate_iql(
+            agent, env, args.eval_episodes, seed=args.seed, chunk_size=args.chunk_size,
+        )
         wandb.log({'evaluation/success_rate': sr}, step=step)
         print(f'step {step}: eval success_rate={sr:.3f}', flush=True)
 
@@ -135,7 +160,9 @@ def main():
 
     log = {f'train/{k}': v for k, v in fit_metrics.items()}
     if args.eval_episodes > 0:
-        sr = evaluate_iql(agent, env, args.eval_episodes, seed=args.seed)
+        sr = evaluate_iql(
+            agent, env, args.eval_episodes, seed=args.seed, chunk_size=args.chunk_size,
+        )
         log['evaluation/success_rate'] = sr
         print(f'done offline iql: eval success_rate={sr:.3f}')
     wandb.log(log)

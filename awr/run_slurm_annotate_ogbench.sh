@@ -2,7 +2,7 @@
 #SBATCH --job-name=awr_oracle_ogbench
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_normal
+#SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
