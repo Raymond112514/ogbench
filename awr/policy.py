@@ -144,6 +144,36 @@ def make_iql_advantage_fn(iql_agent):
     return advantage_fn
 
 
+def actor_ckpt_from_iql(iql_agent, chunk_size: int) -> dict:
+    """Export the jointly trained IQL actor for collection / eval (no second AWR stage)."""
+    actor_params = iql_agent.network.params['modules_actor']
+    # Standalone Actor.apply expects variables={'params': ...}; match extract_awr / create_actor.
+    if 'params' in actor_params:
+        params = actor_params
+    else:
+        params = {'params': actor_params}
+
+    mean_kernel = params['params']['mean_net']['kernel']
+    act_dim = int(mean_kernel.shape[-1])
+    hidden_dims = tuple(int(x) for x in iql_agent.config['actor_hidden_dims'])
+    model = Actor(
+        hidden_dims=hidden_dims,
+        action_dim=act_dim,
+        layer_norm=bool(iql_agent.config['actor_layer_norm']),
+        state_dependent_std=False,
+        const_std=bool(iql_agent.config['const_std']),
+    )
+    return {
+        'mode': 'iql_actor',
+        'params': params,
+        'apply_fn': model.apply,
+        'act_dim': act_dim,
+        'chunk_size': int(chunk_size),
+        'hidden_dims': list(hidden_dims),
+        'metrics': {},
+    }
+
+
 def make_classifier_advantage_fn(clf_ckpt):
     apply_fn, params = clf_ckpt['apply_fn'], clf_ckpt['params']
 

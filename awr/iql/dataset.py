@@ -93,6 +93,36 @@ class IQLDataset:
     def from_paths(cls, paths: list[str | Path]):
         return cls(merge_transitions([transitions_from_rollouts(p) for p in paths]))
 
+    @classmethod
+    def from_ogbench(cls, train_dataset: dict, action_clip_eps: float = 1e-5):
+        """Build from OGBench/FQL singletask dataset dict (same data FQL uses)."""
+        keys = ('observations', 'actions', 'next_observations', 'rewards', 'masks')
+        for k in keys:
+            if k not in train_dataset:
+                raise ValueError(f'OGBench dataset missing key {k!r}')
+        actions = np.asarray(train_dataset['actions'], np.float32)
+        if action_clip_eps is not None:
+            actions = np.clip(actions, -1.0 + action_clip_eps, 1.0 - action_clip_eps)
+        data = {
+            'observations': np.asarray(train_dataset['observations'], np.float32),
+            'actions': actions,
+            'next_observations': np.asarray(train_dataset['next_observations'], np.float32),
+            'rewards': np.asarray(train_dataset['rewards'], np.float32).reshape(-1),
+            'masks': np.asarray(train_dataset['masks'], np.float32).reshape(-1),
+        }
+        return cls(data)
+
+    def subsample(self, percent: float, seed: int = 0) -> 'IQLDataset':
+        """Keep a random `percent`% of transitions (1–100). Deterministic given seed."""
+        if not (0 < percent <= 100):
+            raise ValueError(f'data_percent must be in (0, 100], got {percent}')
+        if percent >= 100:
+            return self
+        n = max(1, int(round(self.size * (percent / 100.0))))
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.choice(self.size, size=n, replace=False))
+        return IQLDataset({k: v[idx] for k, v in self.data.items()})
+
     def sample(self, batch_size: int, rng: np.random.Generator) -> dict[str, np.ndarray]:
         idx = rng.integers(0, self.size, size=batch_size)
         return {k: v[idx] for k, v in self.data.items()}

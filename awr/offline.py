@@ -1,9 +1,12 @@
-"""Offline AWR: collect N episodes -> fit IQL or classifier -> AWR policy extraction.
+"""Offline IQL + AWR on OGBench singletask datasets (same data / loop as FQL).
 
-Nothing is persisted; metrics go to wandb only.
+No GCBC collection and no online fine-tuning — pure offline RL like FQL's IQL baseline:
 
-python awr/offline.py \
-  --advantage iql --num_episodes 1000 --num_workers 10 --train_steps 2000 --awr_epochs 10
+  python awr/offline.py --env_name=cube-single-play-singletask-task1-v0 --alpha 10
+  python awr/offline.py --env_name=cube-single-play-singletask-task2-v0 --alpha 10 --data_percent 10
+
+Uses ogbench.make_env_and_datasets (downloads cube-single-play-v0 once; rewards are
+task-relabeled). Jointly trains V, Q, and the AWR actor every step.
 """
 
 from __future__ import annotations
@@ -22,84 +25,120 @@ if sys.platform.startswith('linux'):
     os.environ.setdefault('MUJOCO_GL', 'egl')
 
 
+def evaluate_iql(agent, env, num_episodes: int, seed: int = 0) -> float:
+    """Eval success rate with the jointly trained IQL actor (single-step actions)."""
+    import jax
+
+    key = jax.random.PRNGKey(seed)
+    successes = []
+    for _ in range(num_episodes):
+        ob, info = env.reset()
+        done = False
+        success = float(info.get('success', 0.0))
+        while not done:
+            key, sample_key = jax.random.split(key)
+            action = np.array(agent.sample_actions(observations=ob, seed=sample_key, temperature=1.0))
+            ob, _, terminated, truncated, info = env.step(action.copy())
+            done = terminated or truncated
+            success = float(info.get('success', 0.0))
+        successes.append(success)
+    return float(np.mean(successes))
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--checkpoint', default='flow_bc/checkpoints/cube_single_gcbc/best.pkl')
-    p.add_argument('--advantage', choices=['iql', 'classifier'], default='iql')
-    p.add_argument('--env_name', default='cube-single-v0')
-    p.add_argument('--task_id', type=int, default=1)
-    p.add_argument('--num_episodes', type=int, default=1000)
-    p.add_argument('--num_workers', type=int, default=10)
-    p.add_argument('--n_flow_steps', type=int, default=10)
-    p.add_argument('--train_steps', type=int, default=2000, help='IQL / classifier gradient steps')
-    p.add_argument('--awr_epochs', type=int, default=10, help='AWR policy-extraction epochs')
+    p.add_argument(
+        '--env_name',
+        default='cube-single-play-singletask-task1-v0',
+        help='OGBench singletask env/dataset name (same as FQL)',
+    )
+    p.add_argument('--train_steps', type=int, default=1_000_000, help='FQL offline_steps default: 1e6')
+    p.add_argument('--log_interval', type=int, default=5000)
+    p.add_argument('--eval_interval', type=int, default=100_000)
+    p.add_argument('--eval_episodes', type=int, default=50)
     p.add_argument('--batch_size', type=int, default=256)
     p.add_argument('--lr', type=float, default=3e-4)
-    p.add_argument('--alpha', type=float, default=10.0, help='AWR temperature')
+    p.add_argument('--alpha', type=float, default=10.0, help='AWR temperature (FQL IQL default: 10)')
     p.add_argument('--expectile', type=float, default=0.9)
-    p.add_argument('--hidden', type=int, default=256, help='Classifier hidden size')
+    p.add_argument('--discount', type=float, default=0.99)
+    p.add_argument('--tau', type=float, default=0.005)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument(
+        '--data_percent',
+        type=float,
+        default=100.0,
+        help='Percent of OGBench training transitions to use (1–100; subsampled with --seed)',
+    )
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu')
+    p.add_argument('--dataset_dir', default=None, help='Override OGBench dataset dir (default ~/.ogbench/data)')
     p.add_argument('--wandb_project', default='awr-offline')
     p.add_argument('--wandb_name', default=None)
     p.add_argument('--wandb_mode', choices=['online', 'offline', 'disabled'], default='online')
-    p.add_argument('--max_oracle_steps', type=int, default=200)
     args = p.parse_args()
+
+    if not (0 < args.data_percent <= 100):
+        p.error(f'--data_percent must be in (0, 100], got {args.data_percent}')
 
     if args.device == 'cpu':
         os.environ['JAX_PLATFORMS'] = 'cpu'
 
+    import ogbench
     import wandb
 
-    from awr.collect import parallel_collect
     from awr.iql.dataset import IQLDataset
-    from awr.policy import extract_awr, make_classifier_advantage_fn, make_iql_advantage_fn
+    from awr.iql.train import train_iql
 
     wandb.init(project=args.wandb_project, name=args.wandb_name, mode=args.wandb_mode, config=vars(args))
 
-    data = parallel_collect(
-        args.checkpoint, args.env_name, args.task_id, args.num_episodes, args.num_workers, args.n_flow_steps,
+    kwargs = {}
+    if args.dataset_dir is not None:
+        kwargs['dataset_dir'] = args.dataset_dir
+
+    print(f'loading OGBench dataset: {args.env_name}')
+    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(args.env_name, **kwargs)
+    dataset = IQLDataset.from_ogbench(train_dataset)
+    full_size = dataset.size
+    dataset = dataset.subsample(args.data_percent, seed=args.seed)
+    print(
+        f'dataset size={dataset.size}/{full_size} ({args.data_percent:g}%)  '
+        f'obs={dataset.data["observations"].shape}  act={dataset.data["actions"].shape}'
     )
-    success_rate = data['success_rate']
-    chunk_size = int(data['chunk_size'])
-    print(f'collected success_rate={success_rate:.3f}')
-
-    if args.advantage == 'classifier':
-        from awr.annotate import annotate_rollouts
-        from awr.classifier.train import train_classifier
-
-        ann, mean_d = annotate_rollouts(
-            data, num_workers=args.num_workers, max_oracle_steps=args.max_oracle_steps,
-        )
-        clf = train_classifier(ann, args.train_steps, args.batch_size, args.lr, args.hidden, args.seed)
-        observations = np.asarray(ann['observations'], np.float32)
-        actions = np.asarray(ann['action_chunks'], np.float32).reshape(len(observations), -1)
-        adv_fn = make_classifier_advantage_fn(clf)
-        fit_metrics = {'classifier/loss': clf['loss'], 'oracle/mean_distance': mean_d}
-    else:
-        from awr.iql.train import train_iql
-
-        agent, fit_metrics = train_iql(
-            [data], args.train_steps, seed=args.seed, batch_size=args.batch_size,
-            expectile=args.expectile, alpha=args.alpha, lr=args.lr,
-        )
-        ds = IQLDataset.from_rollouts([data])
-        observations, actions = ds.data['observations'], ds.data['actions']
-        adv_fn = make_iql_advantage_fn(agent)
-
-    actor = extract_awr(
-        observations, actions, adv_fn, epochs=args.awr_epochs, batch_size=args.batch_size,
-        alpha=args.alpha, lr=args.lr, seed=args.seed, chunk_size=chunk_size,
+    wandb.log(
+        {
+            'dataset/size': dataset.size,
+            'dataset/full_size': full_size,
+            'dataset/data_percent': args.data_percent,
+        },
+        step=0,
     )
 
-    log = {
-        'collect/success_rate': success_rate,
-        'collect/num_transitions': len(data['actions']),
-        **{f'train/{k}': v for k, v in fit_metrics.items()},
-        **{f'awr/{k}': v for k, v in actor['metrics'].items()},
-    }
+    def eval_fn(agent, step):
+        sr = evaluate_iql(agent, env, args.eval_episodes, seed=args.seed)
+        wandb.log({'evaluation/success_rate': sr}, step=step)
+        print(f'step {step}: eval success_rate={sr:.3f}', flush=True)
+
+    agent, fit_metrics = train_iql(
+        args.train_steps,
+        dataset=dataset,
+        seed=args.seed,
+        batch_size=args.batch_size,
+        expectile=args.expectile,
+        alpha=args.alpha,
+        lr=args.lr,
+        discount=args.discount,
+        tau=args.tau,
+        log_interval=args.log_interval,
+        eval_interval=args.eval_interval if args.eval_episodes > 0 else 0,
+        eval_fn=eval_fn if args.eval_episodes > 0 else None,
+        wandb_run=wandb,
+    )
+
+    log = {f'train/{k}': v for k, v in fit_metrics.items()}
+    if args.eval_episodes > 0:
+        sr = evaluate_iql(agent, env, args.eval_episodes, seed=args.seed)
+        log['evaluation/success_rate'] = sr
+        print(f'done offline iql: eval success_rate={sr:.3f}')
     wandb.log(log)
-    print(f'done offline {args.advantage}: success_rate={success_rate:.3f}')
     wandb.finish()
 
 

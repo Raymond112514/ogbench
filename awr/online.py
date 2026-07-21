@@ -1,11 +1,13 @@
-"""Online AWR: collect -> fit advantage -> AWR extract (epochs) -> collect with new policy; repeat.
+"""Online AWR: collect -> fit -> collect with updated policy; repeat.
 
-Each round trains on all data collected thus far (in memory; nothing persisted).
+IQL path matches FQL: joint V + Q + AWR actor (no separate extraction stage).
+Classifier path: fit classifier then AWR-extract for `awr_epochs`.
+
 Round 0 uses the GCBC base policy.
 
 python awr/online.py \
   --advantage iql --rounds 30 --episodes_per_round 100 --num_workers 10 \
-  --train_steps 2000 --awr_epochs 10 --device cpu
+  --train_steps 2000 --device cpu
 """
 
 from __future__ import annotations
@@ -34,12 +36,15 @@ def main():
     p.add_argument('--episodes_per_round', type=int, default=100)
     p.add_argument('--num_workers', type=int, default=10)
     p.add_argument('--n_flow_steps', type=int, default=10)
-    p.add_argument('--train_steps', type=int, default=2000, help='IQL / classifier gradient steps')
-    p.add_argument('--awr_epochs', type=int, default=10, help='AWR policy-extraction epochs per round')
+    p.add_argument('--train_steps', type=int, default=2000, help='IQL joint / classifier gradient steps')
+    p.add_argument('--log_interval', type=int, default=500, help='IQL wandb log interval within a round')
+    p.add_argument('--awr_epochs', type=int, default=10, help='Classifier-only: AWR extraction epochs')
     p.add_argument('--batch_size', type=int, default=256)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--alpha', type=float, default=10.0)
     p.add_argument('--expectile', type=float, default=0.9)
+    p.add_argument('--discount', type=float, default=0.99)
+    p.add_argument('--tau', type=float, default=0.005)
     p.add_argument('--hidden', type=int, default=256)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu')
@@ -55,8 +60,7 @@ def main():
     import wandb
 
     from awr.collect import parallel_collect
-    from awr.iql.dataset import IQLDataset
-    from awr.policy import extract_awr, make_classifier_advantage_fn, make_iql_advantage_fn
+    from awr.policy import actor_ckpt_from_iql, extract_awr, make_classifier_advantage_fn
 
     wandb.init(project=args.wandb_project, name=args.wandb_name, mode=args.wandb_mode, config=vars(args))
 
@@ -95,25 +99,26 @@ def main():
             observations = np.asarray(merged['observations'], np.float32)
             actions = np.asarray(merged['action_chunks'], np.float32).reshape(len(observations), -1)
             adv_fn = make_classifier_advantage_fn(clf)
+            actor_ckpt = extract_awr(
+                observations, actions, adv_fn, epochs=args.awr_epochs, batch_size=args.batch_size,
+                alpha=args.alpha, lr=args.lr, seed=args.seed + r, chunk_size=chunk_size,
+            )
             log['collect/mean_oracle_distance'] = mean_d
             log['train/classifier_loss'] = clf['loss']
+            log.update({f'awr/{k}': v for k, v in actor_ckpt['metrics'].items()})
         else:
             from awr.iql.train import train_iql
 
+            # Joint V/Q/actor like FQL; deploy the jointly trained actor (no second AWR stage).
             agent, fit_metrics = train_iql(
-                rollouts, args.train_steps, seed=args.seed, batch_size=args.batch_size,
+                args.train_steps, rollouts=rollouts, seed=args.seed + r, batch_size=args.batch_size,
                 expectile=args.expectile, alpha=args.alpha, lr=args.lr,
+                discount=args.discount, tau=args.tau,
+                log_interval=args.log_interval, wandb_run=None,
             )
-            ds = IQLDataset.from_rollouts(rollouts)
-            observations, actions = ds.data['observations'], ds.data['actions']
-            adv_fn = make_iql_advantage_fn(agent)
+            actor_ckpt = actor_ckpt_from_iql(agent, chunk_size)
             log.update({f'train/{k}': v for k, v in fit_metrics.items()})
 
-        actor_ckpt = extract_awr(
-            observations, actions, adv_fn, epochs=args.awr_epochs, batch_size=args.batch_size,
-            alpha=args.alpha, lr=args.lr, seed=args.seed + r, chunk_size=chunk_size,
-        )
-        log.update({f'awr/{k}': v for k, v in actor_ckpt['metrics'].items()})
         wandb.log(log)
         print(f'round {r} [{args.advantage}]: success_rate={success_rate:.3f}')
 

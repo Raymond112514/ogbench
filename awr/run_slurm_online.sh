@@ -2,11 +2,11 @@
 #SBATCH --job-name=awr_online_sweep
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_normal
+#SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=60G
 #SBATCH --time=24:00:00
 #SBATCH --array=0-5
@@ -27,10 +27,11 @@ export NUMEXPR_NUM_THREADS=1
 REPO_DIR="${REPO_DIR:-$HOME/ogbench}"
 CHECKPOINT="${CHECKPOINT:-flow_bc/checkpoints/cube_single_gcbc/best.pkl}"
 TRAIN_STEPS=2000
-AWR_EPOCHS=10
+AWR_EPOCHS=10   # classifier-only (IQL trains actor jointly like FQL)
 ROUNDS=30
 EPISODES=100
 NUM_WORKERS=10
+ALPHA="${ALPHA:-10.0}"   # FQL default AWR temperature; override: ALPHA=3.0 sbatch ...
 WANDB_PROJECT="${WANDB_PROJECT:-awr-online}"
 
 COMBOS=(
@@ -46,8 +47,12 @@ read -r ADVANTAGE TASK_ID <<< "${COMBOS[$SLURM_ARRAY_TASK_ID]}"
 mkdir -p "${REPO_DIR}/logs"
 cd "${REPO_DIR}"
 
-run_name="awr_${ADVANTAGE}_task${TASK_ID}_steps${TRAIN_STEPS}_ep${AWR_EPOCHS}_r${ROUNDS}"
-safe_run_name="${run_name//\//_}"
+if [[ "${ADVANTAGE}" == "iql" ]]; then
+  run_name="awr_${ADVANTAGE}_joint_task${TASK_ID}_a${ALPHA}_steps${TRAIN_STEPS}_r${ROUNDS}"
+else
+  run_name="awr_${ADVANTAGE}_task${TASK_ID}_a${ALPHA}_steps${TRAIN_STEPS}_ep${AWR_EPOCHS}_r${ROUNDS}"
+fi
+safe_run_name="${run_name//./p}"
 
 echo "Launching ${run_name}"
 
@@ -60,6 +65,7 @@ python awr/online.py \
   --num_workers "${NUM_WORKERS}" \
   --train_steps "${TRAIN_STEPS}" \
   --awr_epochs "${AWR_EPOCHS}" \
+  --alpha "${ALPHA}" \
   --device auto \
   --wandb_project "${WANDB_PROJECT}" \
   --wandb_name "${run_name}" \
