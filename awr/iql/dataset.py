@@ -172,6 +172,11 @@ class IQLDataset:
             )
         )
 
+    def add(self, new_data: dict[str, np.ndarray]) -> None:
+        """Append new transitions into this buffer in place (for online data collection)."""
+        self.data = {k: np.concatenate([self.data[k], new_data[k]], axis=0) for k in self.data}
+        self.size = len(self.data['observations'])
+
     def subsample(self, percent: float, seed: int = 0) -> 'IQLDataset':
         """Keep a random `percent`% of transitions (1–100). Deterministic given seed."""
         if not (0 < percent <= 100):

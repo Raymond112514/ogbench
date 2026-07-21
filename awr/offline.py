@@ -1,4 +1,4 @@
-"""Offline IQL + AWR on OGBench singletask datasets (same data / loop as FQL).
+"""Offline AWR on OGBench singletask datasets (same data / loop as FQL).
 
 No GCBC collection and no online fine-tuning — pure offline RL like FQL's IQL baseline:
 
@@ -6,9 +6,19 @@ No GCBC collection and no online fine-tuning — pure offline RL like FQL's IQL 
   python awr/offline.py --env_name=cube-single-play-singletask-task1-v0 --chunk_size 4 --alpha 10
 
 Uses ogbench.make_env_and_datasets (downloads cube-single-play-v0 once; rewards are
-task-relabeled). Jointly trains V, Q, and the AWR actor every step.
+task-relabeled). Jointly trains V, Q, and the AWR actor every step (--advantage iql,
+default).
 With --chunk_size 4, actions are packed into length-4 chunks; chunk reward is 0 if any
 of the 4 steps succeeds, else -1.
+
+--advantage classifier swaps the IQL V/Q advantage for a progress classifier trained on
+oracle-improvement labels (s_{t+chunk_size} improved over s_t), keeping everything else
+(joint update frequency, AWR actor loss, eval loop) identical. Requires an oracle-annotated
+npz from awr/annotate_ogbench.py (ideally --data_percent 100):
+
+  python awr/annotate_ogbench.py --env_name=... --output awr/data/task1_oracle.npz
+  python awr/offline.py --env_name=... --advantage classifier --chunk_size 4 \\
+      --annotated_path awr/data/task1_oracle.npz
 """
 
 from __future__ import annotations
@@ -85,6 +95,23 @@ def main():
         default=1,
         help='Action chunk length (1 = single-step FQL default; 4 = pack 4 consecutive actions)',
     )
+    p.add_argument(
+        '--advantage',
+        choices=['iql', 'classifier'],
+        default='iql',
+        help='Advantage source for the AWR actor: IQL V/Q (default) or an oracle-progress classifier',
+    )
+    p.add_argument(
+        '--annotated_path',
+        default=None,
+        help='(--advantage classifier) Oracle-annotated npz from awr/annotate_ogbench.py',
+    )
+    p.add_argument(
+        '--classifier_hidden',
+        type=int,
+        default=256,
+        help='(--advantage classifier) Classifier MLP hidden width',
+    )
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu')
     p.add_argument('--dataset_dir', default=None, help='Override OGBench dataset dir (default ~/.ogbench/data)')
     p.add_argument('--wandb_project', default='awr-offline')
@@ -96,15 +123,14 @@ def main():
         p.error(f'--data_percent must be in (0, 100], got {args.data_percent}')
     if args.chunk_size < 1:
         p.error(f'--chunk_size must be >= 1, got {args.chunk_size}')
+    if args.advantage == 'classifier' and not args.annotated_path:
+        p.error('--advantage classifier requires --annotated_path (see awr/annotate_ogbench.py)')
 
     if args.device == 'cpu':
         os.environ['JAX_PLATFORMS'] = 'cpu'
 
     import ogbench
     import wandb
-
-    from awr.iql.dataset import IQLDataset
-    from awr.iql.train import train_iql
 
     wandb.init(project=args.wandb_project, name=args.wandb_name, mode=args.wandb_mode, config=vars(args))
 
@@ -114,26 +140,6 @@ def main():
 
     print(f'loading OGBench dataset: {args.env_name}  chunk_size={args.chunk_size}')
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(args.env_name, **kwargs)
-    # Chunk first (needs consecutive episode order), then subsample chunks.
-    dataset = IQLDataset.from_ogbench(train_dataset, chunk_size=args.chunk_size)
-    full_size = dataset.size
-    dataset = dataset.subsample(args.data_percent, seed=args.seed)
-    print(
-        f'dataset size={dataset.size}/{full_size} ({args.data_percent:g}%)  '
-        f'obs={dataset.data["observations"].shape}  act={dataset.data["actions"].shape}  '
-        f'reward_mean={float(dataset.data["rewards"].mean()):.4f}'
-    )
-    wandb.log(
-        {
-            'dataset/size': dataset.size,
-            'dataset/full_size': full_size,
-            'dataset/data_percent': args.data_percent,
-            'dataset/chunk_size': args.chunk_size,
-            'dataset/action_dim': int(dataset.data['actions'].shape[-1]),
-            'dataset/reward_mean': float(dataset.data['rewards'].mean()),
-        },
-        step=0,
-    )
 
     def eval_fn(agent, step):
         sr = evaluate_iql(
@@ -142,21 +148,87 @@ def main():
         wandb.log({'evaluation/success_rate': sr}, step=step)
         print(f'step {step}: eval success_rate={sr:.3f}', flush=True)
 
-    agent, fit_metrics = train_iql(
-        args.train_steps,
-        dataset=dataset,
-        seed=args.seed,
-        batch_size=args.batch_size,
-        expectile=args.expectile,
-        alpha=args.alpha,
-        lr=args.lr,
-        discount=args.discount,
-        tau=args.tau,
-        log_interval=args.log_interval,
-        eval_interval=args.eval_interval if args.eval_episodes > 0 else 0,
-        eval_fn=eval_fn if args.eval_episodes > 0 else None,
-        wandb_run=wandb,
-    )
+    if args.advantage == 'classifier':
+        from awr.classifier.ogbench_dataset import ClassifierOgbenchDataset
+        from awr.classifier.train_awr import train_classifier_awr
+
+        print(f'loading oracle-annotated data: {args.annotated_path}')
+        annotated = dict(np.load(args.annotated_path))
+        dataset = ClassifierOgbenchDataset.from_annotated(annotated, chunk_size=args.chunk_size)
+        full_size = dataset.size
+        dataset = dataset.subsample(args.data_percent, seed=args.seed)
+        print(
+            f'dataset size={dataset.size}/{full_size} ({args.data_percent:g}%)  '
+            f'obs={dataset.data["observations"].shape}  act={dataset.data["actions"].shape}  '
+            f'label_mean={float(dataset.data["labels"].mean()):.4f}'
+        )
+        wandb.log(
+            {
+                'dataset/size': dataset.size,
+                'dataset/full_size': full_size,
+                'dataset/data_percent': args.data_percent,
+                'dataset/chunk_size': args.chunk_size,
+                'dataset/action_dim': int(dataset.data['actions'].shape[-1]),
+                'dataset/label_mean': float(dataset.data['labels'].mean()),
+            },
+            step=0,
+        )
+
+        agent, fit_metrics = train_classifier_awr(
+            args.train_steps,
+            dataset=dataset,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            alpha=args.alpha,
+            lr=args.lr,
+            classifier_hidden=args.classifier_hidden,
+            log_interval=args.log_interval,
+            eval_interval=args.eval_interval if args.eval_episodes > 0 else 0,
+            eval_fn=eval_fn if args.eval_episodes > 0 else None,
+            wandb_run=wandb,
+        )
+        done_msg = 'done offline classifier-awr'
+    else:
+        from awr.iql.dataset import IQLDataset
+        from awr.iql.train import train_iql
+
+        # Chunk first (needs consecutive episode order), then subsample chunks.
+        dataset = IQLDataset.from_ogbench(train_dataset, chunk_size=args.chunk_size)
+        full_size = dataset.size
+        dataset = dataset.subsample(args.data_percent, seed=args.seed)
+        print(
+            f'dataset size={dataset.size}/{full_size} ({args.data_percent:g}%)  '
+            f'obs={dataset.data["observations"].shape}  act={dataset.data["actions"].shape}  '
+            f'reward_mean={float(dataset.data["rewards"].mean()):.4f}'
+        )
+        wandb.log(
+            {
+                'dataset/size': dataset.size,
+                'dataset/full_size': full_size,
+                'dataset/data_percent': args.data_percent,
+                'dataset/chunk_size': args.chunk_size,
+                'dataset/action_dim': int(dataset.data['actions'].shape[-1]),
+                'dataset/reward_mean': float(dataset.data['rewards'].mean()),
+            },
+            step=0,
+        )
+
+        agent, fit_metrics = train_iql(
+            args.train_steps,
+            dataset=dataset,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            expectile=args.expectile,
+            alpha=args.alpha,
+            lr=args.lr,
+            discount=args.discount,
+            tau=args.tau,
+            log_interval=args.log_interval,
+            eval_interval=args.eval_interval if args.eval_episodes > 0 else 0,
+            eval_fn=eval_fn if args.eval_episodes > 0 else None,
+            wandb_run=wandb,
+        )
+        done_msg = 'done offline iql'
 
     log = {f'train/{k}': v for k, v in fit_metrics.items()}
     if args.eval_episodes > 0:
@@ -164,7 +236,7 @@ def main():
             agent, env, args.eval_episodes, seed=args.seed, chunk_size=args.chunk_size,
         )
         log['evaluation/success_rate'] = sr
-        print(f'done offline iql: eval success_rate={sr:.3f}')
+        print(f'{done_msg}: eval success_rate={sr:.3f}')
     wandb.log(log)
     wandb.finish()
 

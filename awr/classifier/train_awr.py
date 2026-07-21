@@ -1,16 +1,15 @@
-"""Train IQL jointly (V + Q + AWR actor) — same loop as seohongpark/fql/main.py."""
+"""Train the classifier-advantage AWR agent — same loop shape as awr.iql.train.train_iql."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Callable
 
 import jax.numpy as jnp
 import numpy as np
 from tqdm import trange
 
-from awr.iql.agent import IQLAgent, get_config
-from awr.iql.dataset import IQLDataset
+from awr.classifier.agent import ClassifierAWRAgent, get_config
+from awr.classifier.ogbench_dataset import ClassifierOgbenchDataset
 
 
 def _to_float_metrics(info: dict) -> dict[str, float]:
@@ -23,55 +22,44 @@ def _to_float_metrics(info: dict) -> dict[str, float]:
     return metrics
 
 
-def train_iql(
+def train_classifier_awr(
     steps: int,
     *,
-    dataset: IQLDataset | None = None,
-    rollouts: list[dict] | list[str | Path] | None = None,
-    agent: IQLAgent | None = None,
+    dataset: ClassifierOgbenchDataset,
+    agent: ClassifierAWRAgent | None = None,
     seed: int = 0,
     batch_size: int = 256,
-    expectile: float = 0.9,
     alpha: float = 10.0,
     lr: float = 3e-4,
-    discount: float = 0.99,
-    tau: float = 0.005,
+    classifier_hidden: int = 256,
     log_interval: int = 5000,
     eval_interval: int = 0,
-    eval_fn: Callable[[IQLAgent, int], None] | None = None,
+    eval_fn: Callable[[ClassifierAWRAgent, int], None] | None = None,
     wandb_run: Any = None,
     step_offset: int = 0,
-) -> tuple[IQLAgent, dict]:
-    """Joint IQL update for `steps` gradient steps (value + critic + AWR actor).
+) -> tuple[ClassifierAWRAgent, dict]:
+    """Joint classifier + AWR-actor update for `steps` gradient steps.
 
-    Matches FQL: each `agent.update(batch)` optimizes V, Q, and the actor together.
-    Periodic wandb keys mirror FQL: `training/value/*`, `training/critic/*`, `training/actor/*`.
+    Mirrors train_iql: each `agent.update(batch)` jointly optimizes the classifier and the
+    actor, at the same frequency (every step) with the same logging/eval cadence. Only the
+    advantage source (classifier logit instead of Q - V) differs.
 
     Pass an existing `agent` to keep training it on a (e.g. grown) dataset instead of
     creating a fresh one — used by the online loop to carry the same agent across rounds.
     `step_offset` shifts the wandb/eval step counter so repeated calls (e.g. once per
     round) don't collide on the same logged steps.
     """
-    if dataset is None:
-        if not rollouts:
-            raise ValueError('Provide dataset= or rollouts=')
-        if isinstance(rollouts[0], dict):
-            dataset = IQLDataset.from_rollouts(rollouts)
-        else:
-            dataset = IQLDataset.from_paths(rollouts)
     if dataset.size == 0:
-        raise ValueError('IQL dataset is empty')
+        raise ValueError('classifier dataset is empty')
 
     config = get_config()
     config.batch_size = batch_size
-    config.expectile = expectile
     config.alpha = alpha
     config.lr = lr
-    config.discount = discount
-    config.tau = tau
+    config.classifier_hidden = classifier_hidden
 
     if agent is None:
-        agent = IQLAgent.create(
+        agent = ClassifierAWRAgent.create(
             seed=seed,
             ex_observations=dataset.data['observations'][:1],
             ex_actions=dataset.data['actions'][:1],
@@ -79,7 +67,7 @@ def train_iql(
         )
     rng = np.random.default_rng(seed)
     info = {}
-    for i in trange(1, steps + 1, desc='train iql (joint V/Q/actor)'):
+    for i in trange(1, steps + 1, desc='train classifier-awr (joint classifier/actor)'):
         batch = {k: jnp.asarray(v) for k, v in dataset.sample(config.batch_size, rng).items()}
         agent, info = agent.update(batch)
         step = i + step_offset

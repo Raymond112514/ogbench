@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=60G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-7
+#SBATCH --array=0-3
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 
@@ -32,10 +32,10 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-100000}"
 EVAL_EPISODES="${EVAL_EPISODES:-50}"
 ALPHA="${ALPHA:-10.0}"   # FQL IQL default
 EXPECTILE=0.9
-CHUNK_SIZE="${CHUNK_SIZE:-1}"   # 1 = single-step; 4 = action chunks
+CHUNK_SIZE="${CHUNK_SIZE:-4}"   # 1 = single-step; 4 = action chunks
 WANDB_PROJECT="${WANDB_PROJECT:-awr-offline}"
 
-TASKS=(1 2)
+TASKS=(1)
 PERCENTS=(25 50 75 100)
 TASK_ID="${TASKS[$((SLURM_ARRAY_TASK_ID / 4))]}"
 DATA_PERCENT="${PERCENTS[$((SLURM_ARRAY_TASK_ID % 4))]}"
