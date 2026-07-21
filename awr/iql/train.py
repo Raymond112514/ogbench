@@ -13,7 +13,7 @@ from awr.iql.dataset import IQLDataset
 
 
 def train_iql(
-    data_paths: list[str | Path],
+    rollouts: list[dict] | list[str | Path],
     steps: int,
     seed: int = 0,
     batch_size: int = 256,
@@ -21,7 +21,10 @@ def train_iql(
     alpha: float = 10.0,
     lr: float = 3e-4,
 ) -> tuple[IQLAgent, dict]:
-    dataset = IQLDataset.from_paths(data_paths)
+    if rollouts and isinstance(rollouts[0], dict):
+        dataset = IQLDataset.from_rollouts(rollouts)
+    else:
+        dataset = IQLDataset.from_paths(rollouts)
     if dataset.size == 0:
         raise ValueError('IQL dataset is empty')
 

@@ -12,21 +12,16 @@ def episode_ranges(episode_ends: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(starts, episode_ends))
 
 
-def transitions_from_rollouts(path: str | Path) -> dict[str, np.ndarray]:
-    """Build (s, a_chunk, r, s', mask) from raw collected rollouts.
-
-    Reward uses environment success: 0 if success else -1.
-    mask=0 on success (no bootstrap), else 1.
-    """
-    data = np.load(path, allow_pickle=False)
+def transitions_from_data(data: dict) -> dict[str, np.ndarray]:
+    """Build (s, a_chunk, r, s', mask) from an in-memory rollout dict."""
     if 'successes' not in data:
-        raise ValueError(f'{path} missing per-step successes; re-collect rollouts')
+        raise ValueError('missing per-step successes; re-collect rollouts')
 
     observations = np.asarray(data['observations'], np.float32)
     actions = np.asarray(data['actions'], np.float32)
     successes = np.asarray(data['successes'], bool)
     episode_ends = np.asarray(data['episode_ends'], np.int32)
-    chunk_size = int(data.get('chunk_size', 1))
+    chunk_size = int(np.asarray(data.get('chunk_size', 1)))
     act_dim = actions.shape[-1]
 
     obs_list, act_list, next_list, rew_list, mask_list = [], [], [], [], []
@@ -57,9 +52,31 @@ def transitions_from_rollouts(path: str | Path) -> dict[str, np.ndarray]:
     }
 
 
-def merge_transitions(paths: list[str | Path]) -> dict[str, np.ndarray]:
-    parts = [transitions_from_rollouts(p) for p in paths]
+def transitions_from_rollouts(path: str | Path) -> dict[str, np.ndarray]:
+    return transitions_from_data(dict(np.load(path, allow_pickle=False)))
+
+
+def merge_transitions(parts: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
     return {k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]}
+
+
+def concat_rollouts(rollouts: list[dict]) -> dict:
+    """Concatenate raw rollout dicts (offset episode_ends)."""
+    keys = [
+        'observations', 'actions', 'next_observations', 'next_mjstate',
+        'successes', 'episode_initial_mjstate',
+    ]
+    out = {k: np.concatenate([np.asarray(r[k]) for r in rollouts], axis=0) for k in keys if k in rollouts[0]}
+    ends, offset = [], 0
+    for r in rollouts:
+        for e in r['episode_ends']:
+            ends.append(int(e) + offset)
+        offset = ends[-1]
+    out['episode_ends'] = np.asarray(ends, np.int32)
+    for k in ('goal_xyz', 'task_id', 'chunk_size'):
+        if k in rollouts[0]:
+            out[k] = rollouts[0][k]
+    return out
 
 
 class IQLDataset:
@@ -68,8 +85,13 @@ class IQLDataset:
         self.size = len(data['observations'])
 
     @classmethod
+    def from_rollouts(cls, rollouts: list[dict]):
+        parts = [transitions_from_data(r) for r in rollouts]
+        return cls(merge_transitions(parts))
+
+    @classmethod
     def from_paths(cls, paths: list[str | Path]):
-        return cls(merge_transitions(paths))
+        return cls(merge_transitions([transitions_from_rollouts(p) for p in paths]))
 
     def sample(self, batch_size: int, rng: np.random.Generator) -> dict[str, np.ndarray]:
         idx = rng.integers(0, self.size, size=batch_size)

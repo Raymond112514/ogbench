@@ -1,13 +1,10 @@
 """Online AWR: collect -> fit advantage -> AWR extract (epochs) -> collect with new policy; repeat.
 
-Each round trains on all data collected thus far. Round 0 uses the GCBC base policy.
+Each round trains on all data collected thus far (in memory; nothing persisted).
+Round 0 uses the GCBC base policy.
 
 python awr/online.py \
   --advantage iql --rounds 30 --episodes_per_round 100 --num_workers 10 \
-  --train_steps 2000 --awr_epochs 10 --device cpu
-
-python awr/online.py \
-  --advantage classifier --rounds 30 --episodes_per_round 100 --num_workers 10 \
   --train_steps 2000 --awr_epochs 10 --device cpu
 """
 
@@ -46,7 +43,6 @@ def main():
     p.add_argument('--hidden', type=int, default=256)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu')
-    p.add_argument('--output_dir', default='awr/data/online')
     p.add_argument('--wandb_project', default='awr-online')
     p.add_argument('--wandb_name', default=None)
     p.add_argument('--wandb_mode', choices=['online', 'offline', 'disabled'], default='online')
@@ -58,26 +54,22 @@ def main():
 
     import wandb
 
-    from awr.collect import parallel_collect, save_rollouts
+    from awr.collect import parallel_collect
     from awr.iql.dataset import IQLDataset
     from awr.policy import extract_awr, make_classifier_advantage_fn, make_iql_advantage_fn
 
     wandb.init(project=args.wandb_project, name=args.wandb_name, mode=args.wandb_mode, config=vars(args))
 
     actor_ckpt = None
-    rollout_paths: list[Path] = []
-    annotated_paths: list[Path] = []
+    rollouts: list[dict] = []
+    annotated: list[dict] = []
 
     for r in range(args.rounds):
-        round_dir = Path(args.output_dir) / args.advantage / f'round{r}'
-        raw_path = round_dir / 'rollouts.npz'
-
         data = parallel_collect(
             args.checkpoint, args.env_name, args.task_id, args.episodes_per_round, args.num_workers,
             args.n_flow_steps, actor_ckpt=actor_ckpt,
         )
-        save_rollouts(raw_path, data)
-        rollout_paths.append(raw_path)
+        rollouts.append(data)
         success_rate = data['success_rate']
         chunk_size = int(data['chunk_size'])
 
@@ -86,25 +78,22 @@ def main():
             'collect/mode': 1 if actor_ckpt is not None else 0,
             'collect/success_rate': success_rate,
             'collect/num_transitions': len(data['actions']),
-            'train/num_datasets': len(rollout_paths),
+            'train/num_datasets': len(rollouts),
         }
 
         if args.advantage == 'classifier':
-            from awr.annotate import annotate
+            from awr.annotate import annotate_rollouts
             from awr.classifier.dataset import merge_annotated
             from awr.classifier.train import train_classifier
 
-            ann_path = round_dir / 'annotated.npz'
-            mean_d = annotate(
-                str(raw_path), str(ann_path), num_workers=args.num_workers, max_oracle_steps=args.max_oracle_steps,
+            ann, mean_d = annotate_rollouts(
+                data, num_workers=args.num_workers, max_oracle_steps=args.max_oracle_steps,
             )
-            annotated_paths.append(ann_path)
-            merged = round_dir / 'annotated_all.npz'
-            merge_annotated([str(p) for p in annotated_paths], str(merged))
+            annotated.append(ann)
+            merged = merge_annotated(annotated)
             clf = train_classifier(merged, args.train_steps, args.batch_size, args.lr, args.hidden, args.seed)
-            ann = np.load(merged)
-            observations = np.asarray(ann['observations'], np.float32)
-            actions = np.asarray(ann['action_chunks'], np.float32).reshape(len(observations), -1)
+            observations = np.asarray(merged['observations'], np.float32)
+            actions = np.asarray(merged['action_chunks'], np.float32).reshape(len(observations), -1)
             adv_fn = make_classifier_advantage_fn(clf)
             log['collect/mean_oracle_distance'] = mean_d
             log['train/classifier_loss'] = clf['loss']
@@ -112,10 +101,10 @@ def main():
             from awr.iql.train import train_iql
 
             agent, fit_metrics = train_iql(
-                rollout_paths, args.train_steps, seed=args.seed, batch_size=args.batch_size,
+                rollouts, args.train_steps, seed=args.seed, batch_size=args.batch_size,
                 expectile=args.expectile, alpha=args.alpha, lr=args.lr,
             )
-            ds = IQLDataset.from_paths(rollout_paths)
+            ds = IQLDataset.from_rollouts(rollouts)
             observations, actions = ds.data['observations'], ds.data['actions']
             adv_fn = make_iql_advantage_fn(agent)
             log.update({f'train/{k}': v for k, v in fit_metrics.items()})

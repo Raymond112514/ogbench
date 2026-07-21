@@ -61,7 +61,6 @@ python awr/online.py \
   --train_steps "${TRAIN_STEPS}" \
   --awr_epochs "${AWR_EPOCHS}" \
   --device auto \
-  --output_dir "awr/data/online/${safe_run_name}" \
   --wandb_project "${WANDB_PROJECT}" \
   --wandb_name "${run_name}" \
   --wandb_mode online \

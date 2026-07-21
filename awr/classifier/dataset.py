@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 
 
@@ -21,8 +19,7 @@ def build_samples(episode_ends, distance):
     return np.asarray(indices, np.int64), np.asarray(labels, np.float32)
 
 
-def merge_annotated(paths: list[str | Path], out_path: str) -> str:
-    datas = [dict(np.load(p, allow_pickle=False)) for p in paths]
+def merge_annotated(datas: list[dict]) -> dict:
     keys = [
         'observations', 'actions', 'next_observations', 'next_mjstate',
         'distance', 'action_chunks', 'chunk_masks',
@@ -40,14 +37,12 @@ def merge_annotated(paths: list[str | Path], out_path: str) -> str:
     for k in ('goal_xyz', 'task_id', 'chunk_size', 'policy'):
         if k in datas[0]:
             out[k] = datas[0][k]
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out_path, **out)
-    return out_path
+    return out
 
 
 class ClassifierDataset:
-    def __init__(self, path: str):
-        self.data = np.load(path, mmap_mode='r')
+    def __init__(self, data: dict | str):
+        self.data = np.load(data, mmap_mode='r') if isinstance(data, str) else data
         self.episode_ends = self.data['episode_ends']
         self.indices, self.labels = build_samples(self.episode_ends, self.data['distance'])
         chunks = self.data['action_chunks']

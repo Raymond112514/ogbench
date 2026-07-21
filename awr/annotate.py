@@ -87,8 +87,31 @@ def _annotate_worker(worker_id, input_path, indices, task_id, max_oracle_steps, 
     return indices, distances
 
 
-def annotate(input_path: str, output_path: str, num_workers: int = 10, max_oracle_steps: int = 200, warmup_steps: int = 2):
+def annotate(input_path: str, output_path: str | None = None, num_workers: int = 10, max_oracle_steps: int = 200, warmup_steps: int = 2):
+    """Annotate rollouts. If output_path is None, return the annotated dict only."""
     data = dict(np.load(input_path, allow_pickle=False))
+    out, mean_d = _annotate_from_data(data, str(Path(input_path).resolve()), num_workers, max_oracle_steps, warmup_steps)
+    if output_path is not None:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(output_path, **out)
+    return mean_d if output_path is not None else (out, mean_d)
+
+
+def annotate_rollouts(data: dict, num_workers: int = 10, max_oracle_steps: int = 200, warmup_steps: int = 2):
+    """Annotate an in-memory rollout dict; uses a temp file for worker mmap."""
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(suffix='.npz')
+    os.close(fd)
+    try:
+        np.savez_compressed(tmp, **{k: v for k, v in data.items() if k != 'success_rate'})
+        return annotate(tmp, output_path=None, num_workers=num_workers, max_oracle_steps=max_oracle_steps, warmup_steps=warmup_steps)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _annotate_from_data(data, input_path, num_workers, max_oracle_steps, warmup_steps):
     chunk_size = int(data.get('chunk_size', 1))
     task_id = int(data.get('task_id', 1))
     indices = chunk_boundary_indices(data['episode_ends'], chunk_size)
@@ -97,7 +120,7 @@ def annotate(input_path: str, output_path: str, num_workers: int = 10, max_oracl
     chunks = np.array_split(indices, num_workers)
     with ProcessPoolExecutor(max_workers=num_workers) as pool:
         futs = [
-            pool.submit(_annotate_worker, wid, str(Path(input_path).resolve()), chunk, task_id, max_oracle_steps, warmup_steps)
+            pool.submit(_annotate_worker, wid, input_path, chunk, task_id, max_oracle_steps, warmup_steps)
             for wid, chunk in enumerate(chunks) if len(chunk) > 0
         ]
         for fut in as_completed(futs):
@@ -105,7 +128,6 @@ def annotate(input_path: str, output_path: str, num_workers: int = 10, max_oracl
             dist_map.update(zip(idx_out.tolist(), dist.tolist()))
 
     distance = np.asarray([dist_map[int(t)] for t in indices], np.int32)
-    # subsample to chunk boundaries
     new_ends, count = [], 0
     for start, end in episode_ranges(data['episode_ends']):
         count += len(range(start, end, chunk_size))
@@ -113,10 +135,10 @@ def annotate(input_path: str, output_path: str, num_workers: int = 10, max_oracl
 
     action_chunks, chunk_masks = build_action_chunks(data['actions'], data['episode_ends'], chunk_size, indices)
     out = {
-        'observations': data['observations'][indices],
-        'actions': data['actions'][indices],
-        'next_observations': data['next_observations'][indices],
-        'next_mjstate': data['next_mjstate'][indices],
+        'observations': np.asarray(data['observations'][indices], np.float32),
+        'actions': np.asarray(data['actions'][indices], np.float32),
+        'next_observations': np.asarray(data['next_observations'][indices], np.float32),
+        'next_mjstate': np.asarray(data['next_mjstate'][indices], np.float64),
         'episode_ends': np.asarray(new_ends, np.int32),
         'action_chunks': action_chunks,
         'chunk_masks': chunk_masks,
@@ -126,6 +148,4 @@ def annotate(input_path: str, output_path: str, num_workers: int = 10, max_oracl
     }
     if 'goal_xyz' in data:
         out['goal_xyz'] = data['goal_xyz']
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output_path, **out)
-    return float(distance.mean())
+    return out, float(distance.mean())

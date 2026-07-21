@@ -27,14 +27,14 @@ def _train_step(state, batch):
 
 
 def train_classifier(
-    data_path: str | Path,
+    data: str | Path | dict,
     steps: int,
     batch_size: int = 256,
     lr: float = 3e-4,
     hidden: int = 256,
     seed: int = 0,
 ) -> dict:
-    dataset = ClassifierDataset(str(data_path))
+    dataset = ClassifierDataset(data if isinstance(data, dict) else str(data))
     model = AdvantageClassifier(hidden=hidden)
     key = jax.random.PRNGKey(seed)
     params = model.init(key, jnp.zeros((1, dataset.obs_dim)), jnp.zeros((1, dataset.act_dim)))
