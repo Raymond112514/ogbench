@@ -169,10 +169,12 @@ def main():
     p.add_argument('--val_ratio', type=float, default=0.1)
     p.add_argument('--eval_interval', type=int, default=1000)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--expectile', type=float, default=0.9, help='IQL expectile (ignored for classifier)')
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu',
                    help='JAX backend for training; data collection is always CPU')
     p.add_argument('--output_dir', default='bon_sampling/data/online')
     p.add_argument('--wandb_project', default='bon-online')
+    p.add_argument('--wandb_name', default=None, help='Wandb run name')
     p.add_argument('--wandb_mode', choices=['online', 'offline', 'disabled'], default='online')
     args = p.parse_args()
 
@@ -183,7 +185,12 @@ def main():
 
     import wandb
 
-    wandb.init(project=args.wandb_project, mode=args.wandb_mode, config=vars(args))
+    wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_name,
+        mode=args.wandb_mode,
+        config=vars(args),
+    )
 
     reranker_ckpt = None
     train_paths: list[Path] = []
@@ -229,7 +236,7 @@ def main():
 
                 ckpt_path, metrics = train_iql(
                     train_paths, reranker_path, args.train_steps, seed=args.seed,
-                    batch_size=args.batch_size, chunk_size=chunk_size,
+                    batch_size=args.batch_size, chunk_size=chunk_size, expectile=args.expectile,
                 )
 
             log['train/num_datasets'] = len(train_paths)

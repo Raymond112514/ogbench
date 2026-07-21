@@ -71,6 +71,7 @@ def train_iql(
     seed: int = 0,
     batch_size: int | None = None,
     chunk_size: int = 4,
+    expectile: float = 0.9,
 ) -> tuple[str, dict]:
     dataset = IQLDataset.from_paths(data_paths)
     if dataset.size == 0:
@@ -79,6 +80,7 @@ def train_iql(
     config = get_config()
     if batch_size is not None:
         config.batch_size = batch_size
+    config.expectile = expectile
 
     obs_dim = dataset.data['observations'].shape[1]
     act_dim = dataset.data['actions'].shape[1]
