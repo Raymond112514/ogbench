@@ -9,12 +9,12 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=60G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-9
+#SBATCH --array=0-7
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 
-# Offline joint IQL on the same OGBench play datasets as FQL.
-# Array: tasks {1,2} x alphas {0.3,1,3,10,30}
+# Offline joint IQL (FQL default hparams). Array: tasks {1,2} x data {25,50,75,100}%.
+# Training runs on the allocated GPU (--device auto + --gres=gpu:A5000:1).
 
 source ~/.bashrc
 conda activate ogbench
@@ -30,14 +30,14 @@ TRAIN_STEPS="${TRAIN_STEPS:-1000000}"
 LOG_INTERVAL="${LOG_INTERVAL:-5000}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-100000}"
 EVAL_EPISODES="${EVAL_EPISODES:-50}"
+ALPHA="${ALPHA:-10.0}"   # FQL IQL default
 EXPECTILE=0.9
-DATA_PERCENT="${DATA_PERCENT:-100}"
 WANDB_PROJECT="${WANDB_PROJECT:-awr-offline}"
 
 TASKS=(1 2)
-ALPHAS=(0.3 1.0 3.0 10.0 30.0)
-TASK_ID="${TASKS[$((SLURM_ARRAY_TASK_ID / 5))]}"
-ALPHA="${ALPHAS[$((SLURM_ARRAY_TASK_ID % 5))]}"
+PERCENTS=(25 50 75 100)
+TASK_ID="${TASKS[$((SLURM_ARRAY_TASK_ID / 4))]}"
+DATA_PERCENT="${PERCENTS[$((SLURM_ARRAY_TASK_ID % 4))]}"
 ENV_NAME="cube-single-play-singletask-task${TASK_ID}-v0"
 
 mkdir -p "${REPO_DIR}/logs"

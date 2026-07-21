@@ -12,6 +12,16 @@ def prepare_oracle_env(env):
     u.post_step()
 
 
+def pin_goal(env, goal_xyz):
+    """Pin cube-single target mocap to a fixed task goal."""
+    from ogbench.manipspace import lie
+
+    u = env.unwrapped
+    mid = u._cube_target_mocap_ids[0]
+    u._data.mocap_pos[mid] = np.asarray(goal_xyz, dtype=np.float64)
+    u._data.mocap_quat[mid] = lie.SO3.identity().wxyz
+
+
 def oracle_seed(mjstate):
     return int(np.abs(np.sum(mjstate[:32] * 1000)).astype(np.int64) % (2**31))
 
@@ -30,9 +40,21 @@ def warmup_physics(env, n_steps=2):
     u.post_step()
 
 
-def restore_sim_state(env, mjstate, warmup_steps=2):
+def restore_sim_state(env, mjstate, warmup_steps=2, goal_xyz=None):
     u = env.unwrapped
     set_sim_state(u._model, u._data, mjstate)
+    if goal_xyz is not None:
+        pin_goal(env, goal_xyz)
+    prepare_oracle_env(env)
+    if warmup_steps > 0:
+        warmup_physics(env, warmup_steps)
+
+
+def restore_from_qpos_qvel(env, qpos, qvel, goal_xyz, warmup_steps=2):
+    """Restore physics from OGBench qpos/qvel and pin the task goal."""
+    u = env.unwrapped
+    u.set_state(np.asarray(qpos, np.float64), np.asarray(qvel, np.float64))
+    pin_goal(env, goal_xyz)
     prepare_oracle_env(env)
     if warmup_steps > 0:
         warmup_physics(env, warmup_steps)
@@ -64,11 +86,28 @@ def run_oracle_until_success(oracle_env, oracle, max_steps, seed=0):
     return max_steps, bool(oracle_env.unwrapped._success)
 
 
-def oracle_distance(oracle_env, oracle, mjstate, max_steps, warmup_steps=2):
-    restore_sim_state(oracle_env, mjstate, warmup_steps=warmup_steps)
+def oracle_distance(oracle_env, oracle, mjstate, max_steps, warmup_steps=2, goal_xyz=None):
+    restore_sim_state(oracle_env, mjstate, warmup_steps=warmup_steps, goal_xyz=goal_xyz)
     if oracle_env.unwrapped._success:
         return 0
+    seed_src = mjstate if goal_xyz is None else np.concatenate(
+        [np.asarray(mjstate[:32], np.float64), np.asarray(goal_xyz, np.float64).reshape(-1)]
+    )
     steps, _ = run_oracle_until_success(
-        oracle_env, oracle, max_steps, seed=oracle_seed(mjstate)
+        oracle_env, oracle, max_steps, seed=oracle_seed(seed_src)
+    )
+    return steps
+
+
+def oracle_distance_qpos(oracle_env, oracle, qpos, qvel, goal_xyz, max_steps, warmup_steps=2):
+    """Oracle steps-to-goal from an OGBench (qpos, qvel) state."""
+    restore_from_qpos_qvel(oracle_env, qpos, qvel, goal_xyz, warmup_steps=warmup_steps)
+    if oracle_env.unwrapped._success:
+        return 0
+    seed_src = np.concatenate(
+        [np.asarray(qpos, np.float64).reshape(-1)[:32], np.asarray(goal_xyz, np.float64).reshape(-1)]
+    )
+    steps, _ = run_oracle_until_success(
+        oracle_env, oracle, max_steps, seed=oracle_seed(seed_src)
     )
     return steps
