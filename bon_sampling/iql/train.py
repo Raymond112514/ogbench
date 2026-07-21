@@ -65,7 +65,7 @@ def make_select_fn(agent: IQLAgent):
 
 
 def train_iql(
-    data_paths: list[str | Path],
+    dataset: IQLDataset,
     ckpt_path: str | Path,
     steps: int,
     seed: int = 0,
@@ -74,8 +74,7 @@ def train_iql(
     expectile: float = 0.9,
     init_agent: IQLAgent | None = None,
 ) -> tuple[str, dict, IQLAgent]:
-    """Fit IQL on data_paths. If init_agent is given, continue from it (Adam state carries over)."""
-    dataset = IQLDataset.from_paths(data_paths)
+    """Fit IQL on an in-memory dataset. If init_agent is given, continue from it (Adam carries over)."""
     if dataset.size == 0:
         raise ValueError('IQL dataset is empty')
 

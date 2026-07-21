@@ -1,20 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=online_bon_sweep
+#SBATCH --job-name=online_bon_clf
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
 #SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=60G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-5
+#SBATCH --array=0-8
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 
-# Online BoN: methods {classifier, iql} x task_id {1, 2, 3}.
-# Fit steps=2000, rounds=30.
+# Online BoN classifier only: task_id {1, 2, 3} x seed {0, 1, 2}.
+# Fit steps=2000, rounds=30. Classifier (Adam state) continues across rounds.
 
 # --- env ---
 source ~/.bashrc
@@ -37,25 +37,28 @@ NUM_WORKERS=10
 BON_N=8
 WANDB_PROJECT="${WANDB_PROJECT:-bon-online}"
 
-# Flat sweep: (method, task_id)
+# Flat sweep: (method, task_id, seed)
 COMBOS=(
-  "classifier 1"
-  "classifier 2"
-  "classifier 3"
-  "iql 1"
-  "iql 2"
-  "iql 3"
+  "classifier 1 0"
+  "classifier 1 1"
+  "classifier 1 2"
+  "classifier 2 0"
+  "classifier 2 1"
+  "classifier 2 2"
+  "classifier 3 0"
+  "classifier 3 1"
+  "classifier 3 2"
 )
-read -r METHOD TASK_ID <<< "${COMBOS[$SLURM_ARRAY_TASK_ID]}"
+read -r METHOD TASK_ID SEED <<< "${COMBOS[$SLURM_ARRAY_TASK_ID]}"
 
 mkdir -p "${REPO_DIR}/logs"
 cd "${REPO_DIR}"
 
 echo "SLURM_ARRAY_TASK_ID = ${SLURM_ARRAY_TASK_ID}"
-echo "method = ${METHOD}, task_id = ${TASK_ID}"
+echo "method = ${METHOD}, task_id = ${TASK_ID}, seed = ${SEED}"
 echo "train_steps = ${TRAIN_STEPS}, rounds = ${ROUNDS}"
 
-run_name="${METHOD}_task${TASK_ID}"
+run_name="${METHOD}_task${TASK_ID}_seed${SEED}"
 safe_run_name="${run_name//\//_}"
 
 echo "Launching ${run_name}"
@@ -65,12 +68,12 @@ python bon_sampling/online/online_bon.py \
   --env_name "${ENV_NAME}" \
   --method "${METHOD}" \
   --task_id "${TASK_ID}" \
+  --seed "${SEED}" \
   --rounds "${ROUNDS}" \
   --episodes_per_round "${EPISODES}" \
   --num_workers "${NUM_WORKERS}" \
   --bon_n "${BON_N}" \
   --train_steps "${TRAIN_STEPS}" \
-  --expectile 0.9 \
   --device auto \
   --output_dir "bon_sampling/data/online/${safe_run_name}" \
   --wandb_project "${WANDB_PROJECT}" \
@@ -79,4 +82,4 @@ python bon_sampling/online/online_bon.py \
   > "logs/${safe_run_name}_${SLURM_JOB_ID}.out" \
   2> "logs/${safe_run_name}_${SLURM_JOB_ID}.err"
 
-echo "Finished array task ${SLURM_ARRAY_TASK_ID} (method=${METHOD}, task_id=${TASK_ID})"
+echo "Finished array task ${SLURM_ARRAY_TASK_ID} (method=${METHOD}, task_id=${TASK_ID}, seed=${SEED})"

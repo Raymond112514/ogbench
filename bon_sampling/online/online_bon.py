@@ -6,6 +6,9 @@
   IQL agent (incl. Adam state) is kept across rounds and trained for another --train_steps
   each round on the growing buffer.
 
+Rollouts / annotations stay in memory (no per-round npz archive). A short-lived temp npz
+is used only so parallel oracle workers can mmap during annotation.
+
 Round 0 always collects with the plain GCBC policy. Later rounds use BoN with the previous
 round's reranker. Data collection always runs on CPU (--num_workers parallel envs).
 
@@ -23,6 +26,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -35,7 +39,7 @@ if sys.platform.startswith('linux'):
     os.environ.setdefault('MUJOCO_GL', 'egl')
 
 
-def collect_round(checkpoint, env_name, task_id, n_episodes, num_workers, n_flow_steps, reranker_ckpt, bon_n, out_path):
+def collect_round(checkpoint, env_name, task_id, n_episodes, num_workers, n_flow_steps, reranker_ckpt, bon_n):
     import gymnasium
 
     import ogbench.manipspace  # noqa: F401
@@ -54,9 +58,7 @@ def collect_round(checkpoint, env_name, task_id, n_episodes, num_workers, n_flow
         None, 'cpu', [], reranker_ckpt, 'auto', bon_n,
     )
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_path,
+    data = dict(
         observations=np.asarray(obs, np.float32),
         actions=np.asarray(act, np.float32),
         next_observations=np.asarray(next_obs, np.float32),
@@ -69,39 +71,45 @@ def collect_round(checkpoint, env_name, task_id, n_episodes, num_workers, n_flow
         chunk_size=np.array(meta['chunk_size']),
         policy='bon' if reranker_ckpt else 'flow_bc',
     )
-    return float(np.mean(successes)), len(act), int(meta['chunk_size'])
+    return data, float(np.mean(successes)), len(act), int(meta['chunk_size'])
 
 
-def annotate_round(raw_path, annotated_path, num_workers, max_oracle_steps, warmup_steps):
+def annotate_round(raw: dict, num_workers, max_oracle_steps, warmup_steps):
+    """Oracle-label chunk boundaries. Uses a temp npz only for worker mmap, then deletes it."""
     from bon_sampling.annotate_oracle_distance import annotate_indices, chunk_boundary_indices, subsample_arrays
 
-    data = dict(np.load(raw_path, allow_pickle=False))
-    chunk_size = int(data.get('chunk_size', 1))
-    task_id = int(data.get('task_id', 1))
-    indices = chunk_boundary_indices(data['episode_ends'], chunk_size)
+    chunk_size = int(raw.get('chunk_size', 1))
+    task_id = int(raw.get('task_id', 1))
+    indices = chunk_boundary_indices(raw['episode_ends'], chunk_size)
 
-    dist_map = {}
-    with ProcessPoolExecutor(max_workers=num_workers) as pool:
-        futures = [
-            pool.submit(annotate_indices, wid, str(raw_path), chunk, task_id, 0, max_oracle_steps, warmup_steps, 0)
-            for wid, chunk in enumerate(np.array_split(indices, num_workers))
-            if len(chunk) > 0
-        ]
-        for fut in as_completed(futures):
-            idx_out, dist = fut.result()
-            dist_map.update(zip(idx_out.tolist(), dist.tolist()))
-    distance = np.asarray([dist_map[int(t)] for t in indices], np.int32)
+    fd, tmp = tempfile.mkstemp(suffix='.npz')
+    os.close(fd)
+    try:
+        np.savez(tmp, **raw)
+        dist_map = {}
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            futures = [
+                pool.submit(annotate_indices, wid, tmp, chunk, task_id, 0, max_oracle_steps, warmup_steps, 0)
+                for wid, chunk in enumerate(np.array_split(indices, num_workers))
+                if len(chunk) > 0
+            ]
+            for fut in as_completed(futures):
+                idx_out, dist = fut.result()
+                dist_map.update(zip(idx_out.tolist(), dist.tolist()))
+        distance = np.asarray([dist_map[int(t)] for t in indices], np.int32)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
-    out = subsample_arrays(data, indices, chunk_size)
+    out = subsample_arrays(raw, indices, chunk_size)
     out['distance'] = distance
-    np.savez_compressed(annotated_path, **out)
-    return float(distance.mean())
+    return out, float(distance.mean())
 
 
 def train_classifier(
-    data_path, ckpt_path, steps, batch_size, lr, hidden, val_ratio, seed, eval_interval, init_state=None,
+    annotated: dict, ckpt_path, steps, batch_size, lr, hidden, val_ratio, seed, eval_interval, init_state=None,
 ):
-    """Fit classifier. If init_state is given, continue from it (Adam state carries over)."""
+    """Fit classifier on an in-memory annotated buffer. Warm-starts from init_state if given."""
     import pickle
 
     import jax
@@ -114,7 +122,7 @@ def train_classifier(
     from bon_sampling.advantage.model import AdvantageClassifier
     from bon_sampling.advantage.train import eval_dataset, sample_batch, train_step
 
-    train_data, val_data = make_train_val(str(data_path), val_ratio, seed)
+    train_data, val_data = make_train_val(annotated, val_ratio, seed)
     chunk_size = train_data.chunk_size if train_data.chunk_mode else 1
     obs_dim = train_data.observations.shape[1]
     act_dim = train_data.act_dim
@@ -181,7 +189,7 @@ def main():
     p.add_argument('--expectile', type=float, default=0.9, help='IQL expectile (ignored for classifier)')
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu',
                    help='JAX backend for training; data collection is always CPU')
-    p.add_argument('--output_dir', default='bon_sampling/data/online')
+    p.add_argument('--output_dir', default='bon_sampling/data/online', help='Unused (kept for CLI compat)')
     p.add_argument('--wandb_project', default='bon-online')
     p.add_argument('--wandb_name', default=None, help='Wandb run name')
     p.add_argument('--wandb_mode', choices=['online', 'offline', 'disabled'], default='online')
@@ -189,8 +197,6 @@ def main():
 
     if args.device == 'cpu':
         os.environ['JAX_PLATFORMS'] = 'cpu'
-
-    import tempfile
 
     import wandb
 
@@ -204,19 +210,16 @@ def main():
     reranker_ckpt = None
     iql_agent = None
     clf_state = None
-    train_paths: list[Path] = []
+    annotated_buffer: list[dict] = []
+    iql_dataset = None
     tmp_dir = Path(tempfile.mkdtemp(prefix='bon_reranker_'))
     reranker_path = tmp_dir / 'reranker.pkl'
 
     try:
         for r in range(args.rounds):
-            round_dir = Path(args.output_dir) / args.method / f'round{r}'
-            raw_path = round_dir / 'rollouts.npz'
-            annotated_path = round_dir / 'annotated.npz'
-
-            success_rate, num_transitions, chunk_size = collect_round(
+            raw, success_rate, num_transitions, chunk_size = collect_round(
                 args.checkpoint, args.env_name, args.task_id, args.episodes_per_round, args.num_workers,
-                args.n_flow_steps, reranker_ckpt, args.bon_n, raw_path,
+                args.n_flow_steps, reranker_ckpt, args.bon_n,
             )
 
             log = {
@@ -228,30 +231,35 @@ def main():
             }
 
             if args.method == 'classifier':
-                mean_distance = annotate_round(
-                    raw_path, annotated_path, args.num_workers, args.max_oracle_steps, args.warmup_steps
-                )
-                train_paths.append(annotated_path)
-                from bon_sampling.advantage.dataset import merge_annotated
+                from bon_sampling.advantage.dataset import merge_annotated_dicts
 
-                merged = round_dir / 'annotated_all.npz'
-                merge_annotated([str(p) for p in train_paths], str(merged))
+                annotated, mean_distance = annotate_round(
+                    raw, args.num_workers, args.max_oracle_steps, args.warmup_steps
+                )
+                annotated_buffer.append(annotated)
+                merged = merge_annotated_dicts(annotated_buffer)
                 ckpt_path, metrics, clf_state = train_classifier(
                     merged, reranker_path, args.train_steps, args.batch_size, args.lr, args.hidden,
                     args.val_ratio, args.seed, args.eval_interval, init_state=clf_state,
                 )
                 log['collect/mean_oracle_distance'] = mean_distance
+                log['train/num_datasets'] = len(annotated_buffer)
             else:
-                train_paths.append(raw_path)
+                from bon_sampling.iql.dataset import IQLDataset, transitions_from_data
                 from bon_sampling.iql.train import train_iql
 
+                new_trans = transitions_from_data(raw)
+                if iql_dataset is None:
+                    iql_dataset = IQLDataset(new_trans)
+                else:
+                    iql_dataset.add(new_trans)
                 ckpt_path, metrics, iql_agent = train_iql(
-                    train_paths, reranker_path, args.train_steps, seed=args.seed,
+                    iql_dataset, reranker_path, args.train_steps, seed=args.seed,
                     batch_size=args.batch_size, chunk_size=chunk_size, expectile=args.expectile,
                     init_agent=iql_agent,
                 )
+                log['train/num_datasets'] = iql_dataset.size
 
-            log['train/num_datasets'] = len(train_paths)
             log.update({f'train/{k}': v for k, v in metrics.items()})
             wandb.log(log)
             print(f'round {r} [{args.method}]: success_rate={success_rate:.3f}')

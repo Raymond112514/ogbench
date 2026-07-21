@@ -104,12 +104,15 @@ def mask_for_episodes(episode_ends: np.ndarray, episode_ids: np.ndarray, chunk_m
 class AdvantageDataset:
     def __init__(
         self,
-        path: str,
+        data: str | Path | dict,
         episode_ids: np.ndarray | None = None,
         task: str = 'classifier',
         gamma: float = 0.99,
     ):
-        self.data = np.load(path, mmap_mode='r')
+        if isinstance(data, (str, Path)):
+            self.data = np.load(data, mmap_mode='r')
+        else:
+            self.data = data
         self.observations = self.data['observations']
         self.distance = self.data['distance']
         self.episode_ends = self.data['episode_ends']
@@ -165,24 +168,28 @@ class AdvantageDataset:
 
 
 def make_train_val(
-    path: str,
+    data: str | Path | dict,
     val_ratio: float,
     seed: int,
     task: str = 'classifier',
     gamma: float = 0.99,
 ) -> tuple[AdvantageDataset, AdvantageDataset]:
-    data = np.load(path, allow_pickle=False)
-    num_episodes = len(data['episode_ends'])
+    if isinstance(data, (str, Path)):
+        loaded = np.load(data, allow_pickle=False)
+        num_episodes = len(loaded['episode_ends'])
+        source = data
+    else:
+        num_episodes = len(data['episode_ends'])
+        source = data
     train_eps, val_eps = split_episodes(num_episodes, val_ratio, seed)
     return (
-        AdvantageDataset(path, train_eps, task=task, gamma=gamma),
-        AdvantageDataset(path, val_eps, task=task, gamma=gamma),
+        AdvantageDataset(source, train_eps, task=task, gamma=gamma),
+        AdvantageDataset(source, val_eps, task=task, gamma=gamma),
     )
 
 
-def merge_annotated(paths: list[str], out_path: str) -> str:
-    """Concatenate annotated rollouts; rebuild episode_ends offsets."""
-    datas = [dict(np.load(p, allow_pickle=False)) for p in paths]
+def merge_annotated_dicts(datas: list[dict]) -> dict:
+    """Concatenate annotated rollout dicts in memory; rebuild episode_ends offsets."""
     keys = [
         'observations', 'actions', 'next_observations', 'next_mjstate',
         'distance', 'action_chunks', 'chunk_masks', 'chunk_boundary_indices',
@@ -203,7 +210,13 @@ def merge_annotated(paths: list[str], out_path: str) -> str:
     for k in ('goal_xyz', 'task_id', 'chunk_size', 'policy'):
         if k in datas[0]:
             out[k] = datas[0][k]
+    return out
 
+
+def merge_annotated(paths: list[str], out_path: str) -> str:
+    """Concatenate annotated rollouts; rebuild episode_ends offsets."""
+    datas = [dict(np.load(p, allow_pickle=False)) for p in paths]
+    out = merge_annotated_dicts(datas)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out_path, **out)
     return out_path
