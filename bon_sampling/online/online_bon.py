@@ -1,7 +1,10 @@
 """Online BoN loop: collect -> fit reranker, logging to wandb.
 
 --method classifier: oracle-label, then fit classifier on all annotated data so far.
+  Classifier TrainState (params + Adam) is kept across rounds.
 --method iql: no oracle; fit FQL IQL on all rollouts so far using env success (-1/0).
+  IQL agent (incl. Adam state) is kept across rounds and trained for another --train_steps
+  each round on the growing buffer.
 
 Round 0 always collects with the plain GCBC policy. Later rounds use BoN with the previous
 round's reranker. Data collection always runs on CPU (--num_workers parallel envs).
@@ -95,7 +98,10 @@ def annotate_round(raw_path, annotated_path, num_workers, max_oracle_steps, warm
     return float(distance.mean())
 
 
-def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ratio, seed, eval_interval):
+def train_classifier(
+    data_path, ckpt_path, steps, batch_size, lr, hidden, val_ratio, seed, eval_interval, init_state=None,
+):
+    """Fit classifier. If init_state is given, continue from it (Adam state carries over)."""
     import pickle
 
     import jax
@@ -114,14 +120,17 @@ def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ra
     act_dim = train_data.act_dim
 
     model = AdvantageClassifier(hidden=hidden)
-    key = jax.random.PRNGKey(seed)
-    params = model.init(key, jnp.zeros((1, obs_dim)), jnp.zeros((1, act_dim)))
-    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(lr))
+    if init_state is None:
+        key = jax.random.PRNGKey(seed)
+        params = model.init(key, jnp.zeros((1, obs_dim)), jnp.zeros((1, act_dim)))
+        state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(lr))
+    else:
+        state = init_state
 
     rng = np.random.default_rng(seed)
     best_val_acc, best_val_loss = -1.0, 0.0
     best_params = state.params
-    best_step = 0
+    best_step = int(state.step)
     for step in trange(1, steps + 1, desc='train classifier'):
         batch = sample_batch(train_data, batch_size, rng)
         state, _ = train_step(state, {k: jnp.asarray(v) for k, v in batch.items()})
@@ -129,7 +138,7 @@ def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ra
             val_m = eval_dataset(state, val_data, batch_size, rng)
             if val_m.get('accuracy', 0.0) > best_val_acc:
                 best_val_acc, best_val_loss = val_m['accuracy'], val_m['loss']
-                best_params, best_step = state.params, step
+                best_params, best_step = state.params, int(state.step)
 
     # Temp file for BoN workers only (overwritten each round; not archived).
     Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
@@ -146,7 +155,7 @@ def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ra
             },
             f,
         )
-    return str(ckpt_path), {'val_acc': best_val_acc, 'val_loss': best_val_loss}
+    return str(ckpt_path), {'val_acc': best_val_acc, 'val_loss': best_val_loss}, state
 
 
 def main():
@@ -194,6 +203,7 @@ def main():
 
     reranker_ckpt = None
     iql_agent = None
+    clf_state = None
     train_paths: list[Path] = []
     tmp_dir = Path(tempfile.mkdtemp(prefix='bon_reranker_'))
     reranker_path = tmp_dir / 'reranker.pkl'
@@ -226,9 +236,9 @@ def main():
 
                 merged = round_dir / 'annotated_all.npz'
                 merge_annotated([str(p) for p in train_paths], str(merged))
-                ckpt_path, metrics = train_classifier(
+                ckpt_path, metrics, clf_state = train_classifier(
                     merged, reranker_path, args.train_steps, args.batch_size, args.lr, args.hidden,
-                    args.val_ratio, args.seed, args.eval_interval,
+                    args.val_ratio, args.seed, args.eval_interval, init_state=clf_state,
                 )
                 log['collect/mean_oracle_distance'] = mean_distance
             else:
