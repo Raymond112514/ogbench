@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 
@@ -176,3 +178,32 @@ def make_train_val(
         AdvantageDataset(path, train_eps, task=task, gamma=gamma),
         AdvantageDataset(path, val_eps, task=task, gamma=gamma),
     )
+
+
+def merge_annotated(paths: list[str], out_path: str) -> str:
+    """Concatenate annotated rollouts; rebuild episode_ends offsets."""
+    datas = [dict(np.load(p, allow_pickle=False)) for p in paths]
+    keys = [
+        'observations', 'actions', 'next_observations', 'next_mjstate',
+        'distance', 'action_chunks', 'chunk_masks', 'chunk_boundary_indices',
+    ]
+    out = {}
+    for k in keys:
+        if k in datas[0]:
+            out[k] = np.concatenate([d[k] for d in datas], axis=0)
+
+    ends = []
+    offset = 0
+    for d in datas:
+        for e in d['episode_ends']:
+            ends.append(int(e) + offset)
+        offset = ends[-1]
+    out['episode_ends'] = np.asarray(ends, np.int32)
+
+    for k in ('goal_xyz', 'task_id', 'chunk_size', 'policy'):
+        if k in datas[0]:
+            out[k] = datas[0][k]
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_path, **out)
+    return out_path

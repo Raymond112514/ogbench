@@ -17,7 +17,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-os.environ.setdefault('MUJOCO_GL', 'egl')
+if sys.platform.startswith('linux'):
+    os.environ.setdefault('MUJOCO_GL', 'egl')
 os.environ.setdefault('JAX_PLATFORMS', 'cpu')
 
 import gymnasium

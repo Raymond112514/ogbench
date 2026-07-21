@@ -27,7 +27,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-os.environ.setdefault('MUJOCO_GL', 'egl')
+if sys.platform.startswith('linux'):
+    os.environ.setdefault('MUJOCO_GL', 'egl')
 
 
 def _random_seed() -> int:

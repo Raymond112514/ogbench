@@ -24,7 +24,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-os.environ.setdefault('MUJOCO_GL', 'egl')
+if sys.platform.startswith('linux'):
+    os.environ.setdefault('MUJOCO_GL', 'egl')
 
 NUM_VIDEO_EPISODES = 10
 
@@ -91,6 +92,7 @@ def collect_rollout(
     max_steps: int,
     goal_condition: bool,
     record_frames: bool = False,
+    bon=None,
 ):
     import jax.numpy as jnp
 
@@ -98,7 +100,7 @@ def collect_rollout(
     from flow_bc.model import sample_action_chunk
 
     u = env.unwrapped
-    obs_list, act_list, next_obs_list, state_list = [], [], [], []
+    obs_list, act_list, next_obs_list, state_list, success_list = [], [], [], [], []
     frames = []
     ob, info = env.reset(options=dict(task_id=task_id))
     initial_mjstate = get_sim_state(u._model, u._data)
@@ -113,37 +115,47 @@ def collect_rollout(
         import jax
 
         key, sample_key = jax.random.split(key)
-        chunk = np.asarray(
-            sample_action_chunk(
-                params,
-                apply_fn,
-                jnp.asarray(ob),
-                jnp.asarray(goal) if goal_condition else None,
-                sample_key,
-                chunk_size=chunk_size,
-                act_dim=act_dim,
-                n_flow_steps=n_flow_steps,
-                goal_condition=goal_condition,
+        if bon is None:
+            chunk = np.asarray(
+                sample_action_chunk(
+                    params,
+                    apply_fn,
+                    jnp.asarray(ob),
+                    jnp.asarray(goal) if goal_condition else None,
+                    sample_key,
+                    chunk_size=chunk_size,
+                    act_dim=act_dim,
+                    n_flow_steps=n_flow_steps,
+                    goal_condition=goal_condition,
+                )
             )
-        )
+        else:
+            sample_candidates_fn, select_fn, adv_params = bon
+            candidates = sample_candidates_fn(
+                params, jnp.asarray(ob), jnp.asarray(goal) if goal_condition else None, sample_key
+            )
+            pick = int(select_fn(adv_params, jnp.asarray(ob), candidates))
+            chunk = np.asarray(candidates[pick])
         for k in range(chunk_size):
             if steps >= max_steps:
                 break
             action = chunk[k]
             next_ob, _, terminated, truncated, info = env.step(action)
+            step_success = bool(info.get('success', False))
             if record_frames:
                 frames.append(env.render())
             obs_list.append(ob.copy())
             act_list.append(action.copy())
             next_obs_list.append(next_ob.copy())
             state_list.append(get_sim_state(u._model, u._data))
+            success_list.append(step_success)
             ob = next_ob
             steps += 1
             if terminated or truncated:
-                success = bool(info.get('success', False))
-                return obs_list, act_list, next_obs_list, state_list, success, frames, initial_mjstate
+                success = step_success
+                return obs_list, act_list, next_obs_list, state_list, success_list, success, frames, initial_mjstate
 
-    return obs_list, act_list, next_obs_list, state_list, success, frames, initial_mjstate
+    return obs_list, act_list, next_obs_list, state_list, success_list, success, frames, initial_mjstate
 
 
 def _run_batch(
@@ -157,6 +169,9 @@ def _run_batch(
     egl_device: int | None,
     jax_platform: str,
     gpu_id: int | None,
+    advantage_ckpt: str | None,
+    advantage_mode: str,
+    bon_n: int,
 ) -> list[dict]:
     if jax_platform == 'gpu' and gpu_id is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -179,13 +194,37 @@ def _run_batch(
     act_dim = meta['act_dim']
     goal_condition = meta['goal_condition']
 
+    bon = None
+    if advantage_ckpt is not None:
+        import pickle
+
+        from bon_sampling.advantage.eval import _make_sample_candidates_fn
+
+        with open(advantage_ckpt, 'rb') as f:
+            ckpt_meta = pickle.load(f)
+        sample_candidates_fn = _make_sample_candidates_fn(
+            model.apply, bon_n, chunk_size, act_dim, n_flow_steps, goal_condition
+        )
+        if ckpt_meta.get('mode') == 'iql':
+            from bon_sampling.iql.train import load_iql, make_select_fn
+
+            agent, _ = load_iql(advantage_ckpt)
+            select_fn = make_select_fn(agent)
+            bon = (sample_candidates_fn, select_fn, agent.network.params)
+        else:
+            from bon_sampling.advantage.eval import _load_advantage, _make_select_fn
+
+            adv_model, adv_params, adv_mode, _ = _load_advantage(advantage_ckpt, advantage_mode)
+            select_fn = _make_select_fn(adv_model, adv_mode)
+            bon = (sample_candidates_fn, select_fn, adv_params)
+
     env = gymnasium.make(env_name)
     results: list[dict] = []
 
     for ep in episode_indices:
         ep = int(ep)
         record_frames = ep < NUM_VIDEO_EPISODES
-        obs, acts, next_obs, states, success, frames, initial_mjstate = collect_rollout(
+        obs, acts, next_obs, states, step_successes, success, frames, initial_mjstate = collect_rollout(
             env,
             params,
             model.apply,
@@ -196,6 +235,7 @@ def _run_batch(
             max_steps,
             goal_condition,
             record_frames=record_frames,
+            bon=bon,
         )
         results.append(
             {
@@ -205,6 +245,7 @@ def _run_batch(
                 'next_observations': next_obs,
                 'next_mjstate': states,
                 'initial_mjstate': initial_mjstate,
+                'step_successes': step_successes,
                 'success': success,
                 'frames': frames if record_frames else [],
             }
@@ -227,7 +268,10 @@ def parallel_collect(
     egl_device: int | None,
     jax_platform: str,
     worker_gpu_ids: list[int],
-) -> tuple[list, list, list, list, list, list, list, list]:
+    advantage_ckpt: str | None = None,
+    advantage_mode: str = 'auto',
+    bon_n: int = 8,
+) -> tuple[list, list, list, list, list, list, list, list, list]:
     episode_splits = np.array_split(np.arange(num_rollouts), num_workers)
     merged: list[dict] = []
     ctx = mp.get_context('spawn')
@@ -245,6 +289,9 @@ def parallel_collect(
                 egl_device,
                 jax_platform,
                 worker_gpu_ids[wid] if worker_gpu_ids else None,
+                advantage_ckpt,
+                advantage_mode,
+                bon_n,
             )
             for wid, split in enumerate(episode_splits)
             if len(split) > 0
@@ -254,7 +301,8 @@ def parallel_collect(
 
     merged.sort(key=lambda r: r['ep'])
 
-    all_obs, all_act, all_next_obs, all_state, episode_ends, successes = [], [], [], [], [], []
+    all_obs, all_act, all_next_obs, all_state, all_step_succ = [], [], [], [], []
+    episode_ends, successes = [], []
     episode_initial_mjstate: list[np.ndarray] = []
     video_frames: list[np.ndarray] = []
     for row in merged:
@@ -262,13 +310,17 @@ def parallel_collect(
         all_act.extend(row['actions'])
         all_next_obs.extend(row['next_observations'])
         all_state.extend(row['next_mjstate'])
+        all_step_succ.extend(row['step_successes'])
         episode_ends.append(len(all_act))
         successes.append(row['success'])
         episode_initial_mjstate.append(row['initial_mjstate'])
         if row['frames']:
             video_frames.extend(row['frames'])
 
-    return all_obs, all_act, all_next_obs, all_state, episode_ends, successes, video_frames, episode_initial_mjstate
+    return (
+        all_obs, all_act, all_next_obs, all_state, all_step_succ,
+        episode_ends, successes, video_frames, episode_initial_mjstate,
+    )
 
 
 def main():
@@ -290,6 +342,9 @@ def main():
         help='JAX backend: auto uses cpu for multi-worker, gpu for single-worker',
     )
     p.add_argument('--jax_device', type=int, default=None)
+    p.add_argument('--advantage_ckpt', default=None, help='Classifier checkpoint; enables BoN action selection')
+    p.add_argument('--advantage_mode', choices=('classifier', 'regression', 'auto'), default='auto')
+    p.add_argument('--bon_n', type=int, default=8, help='Number of candidate chunks per BoN step')
     args = p.parse_args()
 
     if args.egl_device is not None:
@@ -318,14 +373,15 @@ def main():
     goal_xyz = tmp_env.unwrapped.task_infos[args.task_id - 1]['goal_xyzs'][0].copy()
     tmp_env.close()
 
+    bon_str = f'BoN(n={args.bon_n}, ckpt={args.advantage_ckpt})' if args.advantage_ckpt else 'off'
     print(
         f'checkpoint={args.checkpoint} env={args.env_name} task_id={args.task_id} ({task_name}) '
         f'max_steps={max_steps} chunk_size={meta["chunk_size"]} '
         f'goal_condition={meta["goal_condition"]} rollouts={args.num_rollouts} '
-        f'workers={num_workers} jax_platform={jax_platform} (randomized resets)'
+        f'workers={num_workers} jax_platform={jax_platform} bon={bon_str} (randomized resets)'
     )
 
-    all_obs, all_act, all_next_obs, all_state, episode_ends, successes, video_frames, episode_initial_mjstate = (
+    all_obs, all_act, all_next_obs, all_state, all_step_succ, episode_ends, successes, video_frames, episode_initial_mjstate = (
         parallel_collect(
             args.checkpoint,
             args.env_name,
@@ -337,6 +393,9 @@ def main():
             args.egl_device,
             jax_platform,
             worker_gpu_ids,
+            args.advantage_ckpt,
+            args.advantage_mode,
+            args.bon_n,
         )
     )
 
@@ -346,12 +405,13 @@ def main():
         actions=np.asarray(all_act, np.float32),
         next_observations=np.asarray(all_next_obs, np.float32),
         next_mjstate=np.asarray(all_state, np.float64),
+        successes=np.asarray(all_step_succ, np.bool_),
         episode_initial_mjstate=np.asarray(episode_initial_mjstate, np.float64),
         goal_xyz=goal_xyz,
         task_id=np.array(args.task_id),
         episode_ends=np.asarray(episode_ends, np.int32),
         chunk_size=np.array(meta['chunk_size']),
-        policy='flow_bc',
+        policy='bon' if args.advantage_ckpt else 'flow_bc',
     )
 
     if video_frames:
