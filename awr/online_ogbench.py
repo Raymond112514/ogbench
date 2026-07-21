@@ -146,6 +146,13 @@ def main():
     p.add_argument('--discount', type=float, default=0.99)
     p.add_argument('--tau', type=float, default=0.005)
     p.add_argument('--classifier_hidden', type=int, default=256)
+    p.add_argument('--val_ratio', type=float, default=0.1, help='(--advantage classifier) Val split for classifier')
+    p.add_argument(
+        '--classifier_update_every',
+        type=int,
+        default=10,
+        help='(--advantage classifier) Update classifier every N actor steps',
+    )
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--data_percent', type=float, default=100.0, help='Percent of OGBench play transitions to seed the initial buffer with')
     p.add_argument('--log_interval', type=int, default=1000)
@@ -200,6 +207,7 @@ def main():
             return train_classifier_awr(
                 steps, dataset=dataset, agent=agent, seed=args.seed, batch_size=args.batch_size,
                 alpha=args.alpha, lr=args.lr, classifier_hidden=args.classifier_hidden,
+                val_ratio=args.val_ratio, classifier_update_every=args.classifier_update_every,
                 log_interval=args.log_interval, wandb_run=wandb, step_offset=step_offset,
             )
     else:

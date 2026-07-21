@@ -1,14 +1,14 @@
 """Classifier-advantage AWR agent — same joint-update recipe as awr.iql.agent.IQLAgent.
 
 The only difference from IQL is the advantage source and its network: a progress
-classifier (BCE on oracle-improvement labels) replaces the V/Q value networks, and its
-logit (analogous to Q - V) is used as the AWR advantage. Everything else — one shared
-TrainState/optimizer, one gradient step per `update(batch)` call jointly moving both
-networks, the AWR actor loss/weighting, and `sample_actions` — is identical to IQL.
+classifier (BCE on oracle-progress labels) replaces the V/Q value networks, and its
+logit (analogous to Q - V) is used as the AWR advantage. The actor is updated every
+step; the classifier can be updated less often via `update(..., update_classifier=)`.
 """
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 import flax
@@ -23,14 +23,14 @@ from awr.iql.networks import Actor
 
 
 class ClassifierAWRAgent(flax.struct.PyTreeNode):
-    """Progress-classifier advantage + AWR actor, trained jointly every step."""
+    """Progress-classifier advantage + AWR actor."""
 
     rng: Any
     network: Any
     config: Any = nonpytree_field()
 
     def classifier_loss(self, batch, grad_params):
-        """BCE loss on progress labels (1 if s_{t+H} improved over s_t, else 0)."""
+        """BCE loss on progress labels."""
         logits = self.network.select('classifier')(
             batch['observations'], batch['actions'], params=grad_params
         )
@@ -44,9 +44,23 @@ class ClassifierAWRAgent(flax.struct.PyTreeNode):
             'label_mean': batch['labels'].mean(),
         }
 
+    def classifier_metrics(self, batch):
+        """Classifier metrics with stop-gradient params (for actor-only steps / val)."""
+        logits = self.network.select('classifier')(batch['observations'], batch['actions'])
+        loss = optax.sigmoid_binary_cross_entropy(logits, batch['labels']).mean()
+        pred = (logits > 0).astype(jnp.float32)
+        return {
+            'classifier_loss': loss,
+            'accuracy': jnp.mean(pred == batch['labels']),
+            'logit_mean': logits.mean(),
+            'label_mean': batch['labels'].mean(),
+        }
+
     def actor_loss(self, batch, grad_params):
         """AWR actor loss; advantage = classifier logit (stop-gradient, like IQL's Q - V)."""
-        adv = self.network.select('classifier')(batch['observations'], batch['actions'])
+        adv = jax.lax.stop_gradient(
+            self.network.select('classifier')(batch['observations'], batch['actions'])
+        )
         exp_a = jnp.minimum(jnp.exp(adv * self.config['alpha']), 100.0)
 
         dist = self.network.select('actor')(batch['observations'], params=grad_params)
@@ -59,31 +73,51 @@ class ClassifierAWRAgent(flax.struct.PyTreeNode):
             'bc_log_prob': log_prob.mean(),
             'mse': jnp.mean((dist.mode() - batch['actions']) ** 2),
             'std': jnp.mean(dist.scale_diag),
+            'weight_mean': exp_a.mean(),
         }
 
-    @jax.jit
-    def total_loss(self, batch, grad_params):
-        """Sum of classifier + actor losses; each only back-props into its own network."""
-        info = {}
-
-        classifier_loss, classifier_info = self.classifier_loss(batch, grad_params)
-        for k, v in classifier_info.items():
-            info[f'classifier/{k}'] = v
-
-        actor_loss, actor_info = self.actor_loss(batch, grad_params)
-        for k, v in actor_info.items():
-            info[f'actor/{k}'] = v
-
-        return classifier_loss + actor_loss, info
-
-    @jax.jit
-    def update(self, batch):
-        """Joint gradient step on classifier + actor (no target networks needed)."""
+    @partial(jax.jit, static_argnames=('update_classifier',))
+    def update(self, batch, update_classifier: bool = True):
+        """Gradient step. Actor always; classifier only if update_classifier=True."""
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params)
+            info = {}
+            actor_loss, actor_info = self.actor_loss(batch, grad_params)
+            for k, v in actor_info.items():
+                info[f'actor/{k}'] = v
 
-        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+            if update_classifier:
+                classifier_loss, classifier_info = self.classifier_loss(batch, grad_params)
+                for k, v in classifier_info.items():
+                    info[f'classifier/{k}'] = v
+                return classifier_loss + actor_loss, info
+
+            for k, v in self.classifier_metrics(batch).items():
+                info[f'classifier/{k}'] = v
+            return actor_loss, info
+
+        grads, info = jax.grad(loss_fn, has_aux=True)(self.network.params)
+        if not update_classifier:
+            # Zero classifier grads so Adam does not coast on stale moments.
+            grads = {
+                **grads,
+                'modules_classifier': jax.tree_util.tree_map(jnp.zeros_like, grads['modules_classifier']),
+            }
+
+        updates, new_opt_state = self.network.tx.update(grads, self.network.opt_state, self.network.params)
+        if not update_classifier:
+            updates = {
+                **updates,
+                'modules_classifier': jax.tree_util.tree_map(jnp.zeros_like, updates['modules_classifier']),
+            }
+        new_params = optax.apply_updates(self.network.params, updates)
+        new_network = self.network.replace(
+            step=self.network.step + 1,
+            params=new_params,
+            opt_state=new_opt_state,
+        )
+        info['classifier/updated'] = jnp.asarray(1.0 if update_classifier else 0.0)
+        info['grad/norm'] = jnp.sqrt(sum(jnp.sum(g ** 2) for g in jax.tree_util.tree_leaves(grads)))
         return self.replace(network=new_network), info
 
     @jax.jit

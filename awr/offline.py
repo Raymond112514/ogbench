@@ -112,6 +112,18 @@ def main():
         default=256,
         help='(--advantage classifier) Classifier MLP hidden width',
     )
+    p.add_argument(
+        '--val_ratio',
+        type=float,
+        default=0.1,
+        help='(--advantage classifier) Fraction of chunks held out for classifier validation',
+    )
+    p.add_argument(
+        '--classifier_update_every',
+        type=int,
+        default=10,
+        help='(--advantage classifier) Update classifier every N actor steps (1 = every step)',
+    )
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu')
     p.add_argument('--dataset_dir', default=None, help='Override OGBench dataset dir (default ~/.ogbench/data)')
     p.add_argument('--wandb_project', default='awr-offline')
@@ -125,6 +137,10 @@ def main():
         p.error(f'--chunk_size must be >= 1, got {args.chunk_size}')
     if args.advantage == 'classifier' and not args.annotated_path:
         p.error('--advantage classifier requires --annotated_path (see awr/annotate_ogbench.py)')
+    if not (0.0 <= args.val_ratio < 1.0):
+        p.error(f'--val_ratio must be in [0, 1), got {args.val_ratio}')
+    if args.classifier_update_every < 1:
+        p.error(f'--classifier_update_every must be >= 1, got {args.classifier_update_every}')
 
     if args.device == 'cpu':
         os.environ['JAX_PLATFORMS'] = 'cpu'
@@ -182,6 +198,8 @@ def main():
             alpha=args.alpha,
             lr=args.lr,
             classifier_hidden=args.classifier_hidden,
+            val_ratio=args.val_ratio,
+            classifier_update_every=args.classifier_update_every,
             log_interval=args.log_interval,
             eval_interval=args.eval_interval if args.eval_episodes > 0 else 0,
             eval_fn=eval_fn if args.eval_episodes > 0 else None,

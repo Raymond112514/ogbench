@@ -92,6 +92,35 @@ class ClassifierOgbenchDataset:
             self.data['observations'][idx], self.data['actions'][idx], self.data['labels'][idx]
         )
 
+    def split_train_val(
+        self, val_ratio: float, seed: int = 0
+    ) -> tuple['ClassifierOgbenchDataset', 'ClassifierOgbenchDataset']:
+        """Random train/val split of chunk samples (deterministic given seed)."""
+        if not (0.0 <= val_ratio < 1.0):
+            raise ValueError(f'val_ratio must be in [0, 1), got {val_ratio}')
+        if val_ratio == 0.0 or self.size < 2:
+            empty = ClassifierOgbenchDataset(
+                self.data['observations'][:0], self.data['actions'][:0], self.data['labels'][:0]
+            )
+            return self, empty
+        n_val = max(1, int(round(self.size * val_ratio)))
+        n_val = min(n_val, self.size - 1)
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(self.size)
+        val_idx = np.sort(perm[:n_val])
+        train_idx = np.sort(perm[n_val:])
+        train = ClassifierOgbenchDataset(
+            self.data['observations'][train_idx],
+            self.data['actions'][train_idx],
+            self.data['labels'][train_idx],
+        )
+        val = ClassifierOgbenchDataset(
+            self.data['observations'][val_idx],
+            self.data['actions'][val_idx],
+            self.data['labels'][val_idx],
+        )
+        return train, val
+
     def sample(self, batch_size: int, rng: np.random.Generator) -> dict[str, np.ndarray]:
         idx = rng.integers(0, self.size, size=batch_size)
         return {k: v[idx] for k, v in self.data.items()}
