@@ -1,15 +1,15 @@
-"""SFT online loop: GCBC → collect → oracle improve labels → binary-advantage AWR.
+"""Filtered BC online loop: keep flow-GCBC, fine-tune only on oracle-improved chunks.
 
 Round k:
-  1. Collect `episodes_per_round` episodes with pi_k (pi_0 = flow-BC GCBC).
+  1. Collect episodes with the current flow policy pi_k (pi_0 = pretrained GCBC).
   2. Oracle-label each action chunk: y=1 if d(s_{t+H}) < d(s_t), else 0.
-  3. Fit a new Gaussian policy with AWR using advantage = y  →  pi_{k+1}.
+  3. Keep only y=1 chunks and continue flow-BC training → pi_{k+1}.
 
-Labeled data accumulates across rounds by default.
+Positive chunks accumulate across rounds by default (true filtered BC, not AWR).
 
 Usage (from ogbench/):
   python sft/online.py \\
-    --policy_ckpt flow_bc/checkpoints/cube_single_gcbc/best.pkl \\
+    --policy_ckpt flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl \\
     --task_id 1 --rounds 50 --episodes_per_round 100
 """
 
@@ -42,7 +42,7 @@ def _capture(env) -> np.ndarray:
     return capture_sim_state(env)
 
 
-def collect_episodes_flow(
+def collect_episodes(
     env,
     params,
     apply_fn,
@@ -63,12 +63,12 @@ def collect_episodes_flow(
     goal_condition = meta['goal_condition']
     key = jax.random.PRNGKey(seed)
 
-    observations, actions, next_observations, successes = [], [], [], []
+    observations, actions, goals, successes = [], [], [], []
     next_mjstate, episode_initial_mjstate, episode_ends = [], [], []
 
     for _ in range(num_episodes):
         ob, info = env.reset(options=dict(task_id=task_id))
-        goal = info['goal'] if goal_condition else None
+        goal = np.asarray(info['goal'], np.float32) if goal_condition else None
         episode_initial_mjstate.append(_capture(env))
         steps = 0
         done = False
@@ -95,107 +95,41 @@ def collect_episodes_flow(
                 done = bool(term or trunc)
                 observations.append(prev)
                 actions.append(np.asarray(a, np.float32))
-                next_observations.append(np.asarray(ob, np.float32))
+                if goal_condition:
+                    goals.append(goal.copy())
                 next_mjstate.append(_capture(env))
                 successes.append(bool(info.get('success', False)))
                 steps += 1
         episode_ends.append(len(actions))
 
-    return _pack_rollout(
-        observations, actions, next_observations, successes,
-        next_mjstate, episode_initial_mjstate, episode_ends, chunk_size,
-    )
-
-
-def collect_episodes_gaussian(
-    env,
-    actor_ckpt: dict,
-    task_id: int,
-    num_episodes: int,
-    max_steps: int,
-    seed: int,
-    temperature: float = 1.0,
-) -> tuple[dict, float]:
-    import jax
-
-    from awr.policy import sample_action_chunk
-
-    chunk_size = int(actor_ckpt['chunk_size'])
-    key = jax.random.PRNGKey(seed)
-
-    observations, actions, next_observations, successes = [], [], [], []
-    next_mjstate, episode_initial_mjstate, episode_ends = [], [], []
-
-    for _ in range(num_episodes):
-        ob, _ = env.reset(options=dict(task_id=task_id))
-        episode_initial_mjstate.append(_capture(env))
-        steps = 0
-        done = False
-        while steps < max_steps and not done:
-            key, sample_key = jax.random.split(key)
-            chunk = sample_action_chunk(actor_ckpt, ob, sample_key, temperature=temperature)
-            for a in chunk:
-                if steps >= max_steps or done:
-                    break
-                prev = np.asarray(ob, np.float32)
-                ob, _, term, trunc, info = env.step(np.clip(a, -1.0, 1.0))
-                done = bool(term or trunc)
-                observations.append(prev)
-                actions.append(np.asarray(a, np.float32))
-                next_observations.append(np.asarray(ob, np.float32))
-                next_mjstate.append(_capture(env))
-                successes.append(bool(info.get('success', False)))
-                steps += 1
-        episode_ends.append(len(actions))
-
-    return _pack_rollout(
-        observations, actions, next_observations, successes,
-        next_mjstate, episode_initial_mjstate, episode_ends, chunk_size,
-    )
-
-
-def _pack_rollout(observations, actions, next_observations, successes,
-                  next_mjstate, episode_initial_mjstate, episode_ends, chunk_size):
     ends = np.asarray(episode_ends, np.int32)
     succ = np.asarray(successes, np.bool_)
     success_rate = float(succ[ends - 1].mean()) if len(ends) else 0.0
     rollout = dict(
         observations=np.asarray(observations, np.float32),
         actions=np.asarray(actions, np.float32),
-        next_observations=np.asarray(next_observations, np.float32),
         successes=succ,
         next_mjstate=np.asarray(next_mjstate, np.float64),
         episode_initial_mjstate=np.asarray(episode_initial_mjstate, np.float64),
         episode_ends=ends,
         chunk_size=np.array(chunk_size),
     )
+    if goal_condition:
+        rollout['goals'] = np.asarray(goals, np.float32)
     return rollout, success_rate
 
 
 def evaluate_policy(
-    env,
-    policy,  # ('flow', params, apply_fn, meta) or ('gaussian', actor_ckpt)
-    task_id: int,
-    num_episodes: int,
-    max_steps: int,
-    seed: int,
-    n_flow_steps: int = 10,
+    env, params, apply_fn, meta, task_id, num_episodes, max_steps, seed, n_flow_steps,
 ) -> float:
-    if policy[0] == 'flow':
-        _, params, apply_fn, meta = policy
-        _, sr = collect_episodes_flow(
-            env, params, apply_fn, meta, task_id, num_episodes, n_flow_steps, max_steps, seed,
-        )
-        return sr
-    _, actor_ckpt = policy
-    _, sr = collect_episodes_gaussian(
-        env, actor_ckpt, task_id, num_episodes, max_steps, seed, temperature=1.0,
+    _, sr = collect_episodes(
+        env, params, apply_fn, meta, task_id, num_episodes, n_flow_steps, max_steps, seed,
     )
     return sr
 
 
 # ---------------------------------------------------------------------------
-# Oracle labeling
+# Oracle labeling → filtered chunks
 # ---------------------------------------------------------------------------
 
 
@@ -230,7 +164,6 @@ def _annotate_worker(worker_id, input_path, indices, goal_xyz, max_oracle_steps,
     data = dict(np.load(input_path, allow_pickle=False))
     episode_ends = data['episode_ends']
     starts = [0] + episode_ends[:-1].tolist()
-    # map global t -> (ep_start, ep_idx)
     t_to_ep = {}
     for ep_idx, (start, end) in enumerate(zip(starts, episode_ends.tolist())):
         for t in range(start, end):
@@ -257,16 +190,18 @@ def _annotate_worker(worker_id, input_path, indices, goal_xyz, max_oracle_steps,
     return indices, distances
 
 
-def label_rollout(
+def label_and_filter(
     rollout: dict,
     goal_xyz: np.ndarray,
     chunk_size: int,
+    act_dim: int,
     num_workers: int,
     max_oracle_steps: int,
     warmup_steps: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return chunk-level (obs, flat_actions, improve_label)."""
-    from awr.classifier.ogbench_dataset import build_chunk_progress
+    goal_condition: bool,
+) -> tuple[dict, dict]:
+    """Oracle-label chunks; return (stats, filtered flow-BC batch dict of positives only)."""
+    from awr.classifier.ogbench_dataset import episode_ends as ends_from_terminals
 
     n = len(rollout['observations'])
     terminals = np.zeros(n, np.float32)
@@ -302,75 +237,98 @@ def label_rollout(
         if os.path.exists(tmp):
             os.remove(tmp)
 
-    return build_chunk_progress(
-        rollout['observations'], rollout['actions'], terminals, distance, chunk_size,
-    )
+    obs_list, goal_list, chunk_list, mask_list = [], [], [], []
+    n_total, n_pos = 0, 0
+    start = 0
+    for end in ends_from_terminals(terminals, n):
+        t = start
+        while t + chunk_size < end:
+            n_total += 1
+            improved = distance[t + chunk_size] < distance[t]
+            if improved:
+                n_pos += 1
+                chunk = rollout['actions'][t : t + chunk_size]
+                obs_list.append(rollout['observations'][t])
+                chunk_list.append(chunk)
+                mask_list.append(np.ones(chunk_size, np.float32))
+                if goal_condition:
+                    goal_list.append(rollout['goals'][t])
+            t += chunk_size
+        start = end
+
+    stats = {
+        'num_chunks': n_total,
+        'num_positive': n_pos,
+        'improve_frac': float(n_pos / max(n_total, 1)),
+    }
+    if n_pos == 0:
+        empty = {
+            'observations': np.zeros((0, rollout['observations'].shape[1]), np.float32),
+            'action_chunks': np.zeros((0, chunk_size, act_dim), np.float32),
+            'chunk_masks': np.zeros((0, chunk_size), np.float32),
+        }
+        if goal_condition:
+            empty['goals'] = np.zeros((0, rollout['goals'].shape[1]), np.float32)
+        return stats, empty
+
+    filtered = {
+        'observations': np.asarray(obs_list, np.float32),
+        'action_chunks': np.asarray(chunk_list, np.float32),
+        'chunk_masks': np.asarray(mask_list, np.float32),
+    }
+    if goal_condition:
+        filtered['goals'] = np.asarray(goal_list, np.float32)
+    return stats, filtered
+
+
+def merge_filtered(buffers: list[dict]) -> dict:
+    keys = buffers[0].keys()
+    return {k: np.concatenate([b[k] for b in buffers], axis=0) for k in keys}
 
 
 # ---------------------------------------------------------------------------
-# AWR with binary advantage
+# Filtered flow-BC fine-tune
 # ---------------------------------------------------------------------------
 
 
-def train_awr_binary(
-    observations: np.ndarray,
-    actions: np.ndarray,
-    labels: np.ndarray,
+def continue_flow_bc(
+    params,
+    apply_fn,
+    data: dict,
     *,
     train_steps: int,
     batch_size: int,
-    alpha: float,
     lr: float,
     seed: int,
-    chunk_size: int,
-    hidden_dims=(512, 512, 512, 512),
-) -> dict:
-    """Fit a fresh Gaussian actor with AWR; advantage = binary improve label."""
+    goal_condition: bool,
+) -> tuple[object, float]:
+    """Continue Adam updates on filtered positive chunks; return (new_params, last_loss)."""
     import jax
     import jax.numpy as jnp
+    import optax
+    from flax.training import train_state
     from tqdm import trange
 
-    from awr.policy import _awr_loss, create_actor, weight_stats
+    from flow_bc.model import train_step
 
-    model, state = create_actor(
-        observations.shape[1], actions.shape[1],
-        hidden_dims=hidden_dims, lr=lr, seed=seed,
-    )
-    n = len(observations)
+    n = len(data['observations'])
+    if n == 0:
+        raise ValueError('no positive chunks to train on')
+
+    tx = optax.adam(lr)
+    state = train_state.TrainState.create(apply_fn=apply_fn, params=params, tx=tx)
     rng = np.random.default_rng(seed)
-    info = {}
+    key = jax.random.PRNGKey(seed)
+    last_loss = 0.0
 
-    @jax.jit
-    def train_step(state, obs, acts, adv):
-        def loss_fn(params):
-            dist = state.apply_fn(params, obs)
-            return _awr_loss(dist, acts, adv, alpha)
-
-        (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-        return state.apply_gradients(grads=grads), metrics
-
-    for _ in trange(train_steps, desc='awr', leave=False):
+    for _ in trange(train_steps, desc='filtered-bc', leave=False):
         idx = rng.integers(0, n, size=min(batch_size, n))
-        state, info = train_step(
-            state,
-            jnp.asarray(observations[idx]),
-            jnp.asarray(actions[idx]),
-            jnp.asarray(labels[idx]),
-        )
+        batch = {k: jnp.asarray(v[idx]) for k, v in data.items()}
+        key, step_key = jax.random.split(key)
+        state, loss = train_step(state, batch, step_key, goal_condition=goal_condition)
+        last_loss = float(loss)
 
-    metrics = {k: float(v) for k, v in info.items()}
-    metrics.update(weight_stats(labels, alpha))
-    metrics['label_mean'] = float(labels.mean())
-    return {
-        'mode': 'awr_actor',
-        'params': state.params,
-        'apply_fn': model.apply,
-        'obs_dim': int(observations.shape[1]),
-        'act_dim': int(actions.shape[1]),
-        'chunk_size': int(chunk_size),
-        'hidden_dims': list(hidden_dims),
-        'metrics': metrics,
-    }
+    return state.params, last_loss
 
 
 # ---------------------------------------------------------------------------
@@ -389,17 +347,15 @@ def main():
     p.add_argument('--eval_episodes', type=int, default=50)
     p.add_argument('--n_flow_steps', type=int, default=10)
     p.add_argument('--max_steps', type=int, default=None)
-    p.add_argument('--train_steps', type=int, default=5000, help='AWR gradient steps per round')
+    p.add_argument('--train_steps', type=int, default=5000, help='Flow-BC gradient steps per round')
     p.add_argument('--batch_size', type=int, default=256)
-    p.add_argument('--alpha', type=float, default=10.0, help='AWR temperature on binary labels')
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--num_workers', type=int, default=10, help='Parallel oracle-label workers')
     p.add_argument('--max_oracle_steps', type=int, default=200)
     p.add_argument('--warmup_steps', type=int, default=2)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--no_accumulate', action='store_true',
-                   help='Train each round only on that round\'s data (default: accumulate)')
-    p.add_argument('--output_dir', default='sft/checkpoints')
+                   help='Train each round only on that round\'s positives (default: accumulate)')
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu')
     p.add_argument('--wandb_project', default='sft-online')
     p.add_argument('--wandb_name', default=None)
@@ -413,7 +369,6 @@ def main():
     import wandb
 
     import ogbench.manipspace  # noqa: F401
-    from awr.policy import save_actor
     from flow_bc.checkpoint import load_flow_bc
 
     wandb.init(
@@ -423,99 +378,94 @@ def main():
         config=vars(args),
     )
 
-    flow_model, flow_params, meta = load_flow_bc(args.policy_ckpt)
+    model, params, meta = load_flow_bc(args.policy_ckpt)
     env_name = meta.get('eval_env_name', args.env_name)
     chunk_size = int(meta['chunk_size'])
+    act_dim = int(meta['act_dim'])
+    goal_condition = bool(meta['goal_condition'])
+    apply_fn = model.apply
 
     env = gymnasium.make(env_name)
     max_steps = args.max_steps or env.spec.max_episode_steps
     goal_xyz = env.unwrapped.task_infos[args.task_id - 1]['goal_xyzs'][0].copy()
     task_name = env.unwrapped.task_infos[args.task_id - 1]['task_name']
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     print(
-        f'SFT online | env={env_name} task={args.task_id} ({task_name}) '
+        f'Filtered BC | env={env_name} task={args.task_id} ({task_name}) '
         f'chunk={chunk_size} rounds={args.rounds} eps/round={args.episodes_per_round}'
     )
 
-    # pi_0 = GCBC
-    policy = ('flow', flow_params, flow_model.apply, meta)
-    buf_obs, buf_act, buf_lab = [], [], []
+    buffers: list[dict] = []
 
-    # Eval pi_0
     sr0 = evaluate_policy(
-        env, policy, args.task_id, args.eval_episodes, max_steps, args.seed, args.n_flow_steps,
+        env, params, apply_fn, meta, args.task_id, args.eval_episodes,
+        max_steps, args.seed, args.n_flow_steps,
     )
     print(f'round 0 (GCBC) eval success={sr0:.3f}')
     wandb.log({'round': 0, 'eval/success_rate': sr0, 'policy': 'gcbc'}, step=0)
 
     for k in range(1, args.rounds + 1):
-        # 1. Collect
-        if policy[0] == 'flow':
-            _, params, apply_fn, meta_k = policy
-            rollout, collect_sr = collect_episodes_flow(
-                env, params, apply_fn, meta_k, args.task_id,
-                args.episodes_per_round, args.n_flow_steps, max_steps, args.seed + k,
-            )
-        else:
-            rollout, collect_sr = collect_episodes_gaussian(
-                env, policy[1], args.task_id,
-                args.episodes_per_round, max_steps, args.seed + k,
-            )
+        rollout, collect_sr = collect_episodes(
+            env, params, apply_fn, meta, args.task_id,
+            args.episodes_per_round, args.n_flow_steps, max_steps, args.seed + k,
+        )
         print(f'round {k}: collected {args.episodes_per_round} eps, success={collect_sr:.3f}')
 
-        # 2. Oracle label
-        obs, act, labels = label_rollout(
-            rollout, goal_xyz, chunk_size, args.num_workers,
-            args.max_oracle_steps, args.warmup_steps,
+        stats, filtered = label_and_filter(
+            rollout, goal_xyz, chunk_size, act_dim, args.num_workers,
+            args.max_oracle_steps, args.warmup_steps, goal_condition,
         )
-        pos_frac = float(labels.mean()) if len(labels) else 0.0
-        print(f'round {k}: labeled {len(labels)} chunks, improve_frac={pos_frac:.3f}')
+        print(
+            f'round {k}: chunks={stats["num_chunks"]} '
+            f'positives={stats["num_positive"]} improve_frac={stats["improve_frac"]:.3f}'
+        )
+
+        if stats['num_positive'] == 0:
+            print(f'round {k}: no positive chunks; skipping train', flush=True)
+            wandb.log({
+                'round': k,
+                'collect/success_rate': collect_sr,
+                'label/improve_frac': stats['improve_frac'],
+                'label/num_chunks': stats['num_chunks'],
+                'label/num_positive': 0,
+                'dataset/size': sum(len(b['observations']) for b in buffers),
+                'eval/success_rate': collect_sr,
+            }, step=k)
+            continue
 
         if args.no_accumulate:
-            buf_obs, buf_act, buf_lab = [obs], [act], [labels]
+            buffers = [filtered]
         else:
-            buf_obs.append(obs)
-            buf_act.append(act)
-            buf_lab.append(labels)
+            buffers.append(filtered)
+        data = merge_filtered(buffers)
 
-        all_obs = np.concatenate(buf_obs, axis=0)
-        all_act = np.concatenate(buf_act, axis=0)
-        all_lab = np.concatenate(buf_lab, axis=0)
-
-        # 3. AWR → pi_{k+1}  (advantage = binary label)
-        actor = train_awr_binary(
-            all_obs, all_act, all_lab,
+        params, last_loss = continue_flow_bc(
+            params, apply_fn, data,
             train_steps=args.train_steps,
             batch_size=args.batch_size,
-            alpha=args.alpha,
             lr=args.lr,
             seed=args.seed + k,
-            chunk_size=chunk_size,
+            goal_condition=goal_condition,
         )
-        ckpt_path = out_dir / f'round{k:03d}.pkl'
-        save_actor(str(ckpt_path), actor)
-        policy = ('gaussian', actor)
 
-        # Eval
         eval_sr = evaluate_policy(
-            env, policy, args.task_id, args.eval_episodes, max_steps, args.seed + 10_000 + k,
+            env, params, apply_fn, meta, args.task_id, args.eval_episodes,
+            max_steps, args.seed + 10_000 + k, args.n_flow_steps,
         )
         log = {
             'round': k,
             'collect/success_rate': collect_sr,
-            'label/improve_frac': pos_frac,
-            'label/num_chunks': len(labels),
-            'dataset/size': len(all_obs),
-            'dataset/improve_frac': float(all_lab.mean()),
+            'label/improve_frac': stats['improve_frac'],
+            'label/num_chunks': stats['num_chunks'],
+            'label/num_positive': stats['num_positive'],
+            'dataset/size': len(data['observations']),
+            'train/loss': last_loss,
             'eval/success_rate': eval_sr,
-            **{f'train/{kk}': vv for kk, vv in actor['metrics'].items()},
         }
         wandb.log(log, step=k)
         print(
-            f'round {k}: buffer={len(all_obs)} eval_success={eval_sr:.3f} '
-            f'-> {ckpt_path}',
+            f'round {k}: buffer={len(data["observations"])} loss={last_loss:.4f} '
+            f'eval_success={eval_sr:.3f}',
             flush=True,
         )
 

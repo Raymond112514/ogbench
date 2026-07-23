@@ -1,1 +1,1 @@
-"""Online SFT / binary-advantage AWR starting from a GCBC policy."""
+"""Online filtered BC starting from a flow-GCBC policy."""
