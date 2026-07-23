@@ -1,19 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=sft_filtered_bc
+#SBATCH --job-name=sft_filtered_bc_offline
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_high
+#SBATCH --qos=rail_gpu4_normal
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=12
 #SBATCH --mem=60G
 #SBATCH --time=48:00:00
 #SBATCH --array=0-19
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 
-# Online filtered BC: keep flow-GCBC, fine-tune only on oracle-improved chunks.
+# Offline filtered BC: collect once, oracle-filter, train with periodic eval.
 # Array: task_id {1,2,3,4,5} x seed {0,10,100,1000} = 20 runs.
 
 source ~/.bashrc
@@ -28,12 +28,13 @@ export NUMEXPR_NUM_THREADS=1
 REPO_DIR="${REPO_DIR:-$HOME/ogbench}"
 POLICY_CKPT="${POLICY_CKPT:-flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl}"
 
-ROUNDS="${ROUNDS:-50}"
-EPISODES_PER_ROUND="${EPISODES_PER_ROUND:-100}"
+NUM_EPISODES="${NUM_EPISODES:-10000}"
+TRAIN_STEPS="${TRAIN_STEPS:-100000}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
 EVAL_EPISODES="${EVAL_EPISODES:-50}"
-TRAIN_STEPS="${TRAIN_STEPS:-5000}"
+COLLECT_WORKERS="${COLLECT_WORKERS:-10}"
 NUM_WORKERS="${NUM_WORKERS:-10}"
-WANDB_PROJECT="${WANDB_PROJECT:-sft-filtered-bc}"
+WANDB_PROJECT="${WANDB_PROJECT:-sft-filtered-bc-offline}"
 
 TASKS=(1 2 3 4 5)
 SEEDS=(0 10 100 1000)
@@ -43,23 +44,24 @@ SEED="${SEEDS[$((SLURM_ARRAY_TASK_ID % 4))]}"
 mkdir -p "${REPO_DIR}/logs"
 cd "${REPO_DIR}"
 
-run_name="filtered_bc_task${TASK_ID}_r${ROUNDS}_ep${EPISODES_PER_ROUND}_seed${SEED}"
+run_name="filtered_bc_offline_task${TASK_ID}_ep${NUM_EPISODES}_steps${TRAIN_STEPS}_seed${SEED}"
 safe_run_name="${run_name//./p}"
 
 echo "SLURM_ARRAY_TASK_ID = ${SLURM_ARRAY_TASK_ID}"
 echo "task_id = ${TASK_ID}"
 echo "seed = ${SEED}"
 echo "policy_ckpt = ${POLICY_CKPT}"
-echo "rounds = ${ROUNDS}"
+echo "num_episodes = ${NUM_EPISODES}"
 echo "Launching ${run_name}"
 
-python sft/online.py \
+python sft/offline.py \
   --policy_ckpt "${POLICY_CKPT}" \
   --task_id "${TASK_ID}" \
-  --rounds "${ROUNDS}" \
-  --episodes_per_round "${EPISODES_PER_ROUND}" \
-  --eval_episodes "${EVAL_EPISODES}" \
+  --num_episodes "${NUM_EPISODES}" \
+  --collect_workers "${COLLECT_WORKERS}" \
   --train_steps "${TRAIN_STEPS}" \
+  --eval_interval "${EVAL_INTERVAL}" \
+  --eval_episodes "${EVAL_EPISODES}" \
   --num_workers "${NUM_WORKERS}" \
   --seed "${SEED}" \
   --device auto \
