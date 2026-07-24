@@ -19,15 +19,23 @@ def value_target(d: np.ndarray, d_prime: np.ndarray, gamma: float) -> np.ndarray
     return (np.power(gamma, d_prime) - np.power(gamma, d - 1.0)) / (1.0 - gamma)
 
 
-def build_samples(episode_ends: np.ndarray, distance: np.ndarray, chunk_mode: bool) -> tuple[np.ndarray, np.ndarray]:
+def build_samples(
+    episode_ends: np.ndarray,
+    distance: np.ndarray,
+    chunk_mode: bool,
+    horizon: int = 1,
+    tau: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Build (index, label) pairs.
 
-    chunk_mode (distance[t] = d(s_t) at replan):
-        y=1 if d(s_{t+1}) < d(s_t), i.e. distance[t+1] < distance[t]
+    y=1 iff d(s) - d(s') >= H - tau. Default tau = H - 1 ⇒ threshold 1.
 
-    per_step (legacy, distance[t] = d(s_{t+1})):
-        y=1 if distance[t] < distance[t-1]
+    chunk_mode: consecutive distance entries are chunk-boundary states (H = horizon).
+    per_step (legacy): consecutive steps (H = 1).
     """
+    from awr.oracle_utils import progress_label
+
+    h = int(horizon) if chunk_mode else 1
     indices = []
     labels = []
     for start, end in episode_ranges(episode_ends):
@@ -36,13 +44,13 @@ def build_samples(episode_ends: np.ndarray, distance: np.ndarray, chunk_mode: bo
                 d_t = distance[t]
                 d_tp1 = distance[t + 1]
                 indices.append(t)
-                labels.append(0 if d_t < d_tp1 else 1)
+                labels.append(progress_label(d_t, d_tp1, h, tau))
         else:
             for t in range(start + 1, end):
                 d_t = distance[t - 1]
                 d_tp1 = distance[t]
                 indices.append(t)
-                labels.append(0 if d_t < d_tp1 else 1)
+                labels.append(progress_label(d_t, d_tp1, 1, tau))
     return np.asarray(indices, np.int64), np.asarray(labels, np.float32)
 
 
@@ -108,6 +116,7 @@ class AdvantageDataset:
         episode_ids: np.ndarray | None = None,
         task: str = 'classifier',
         gamma: float = 0.99,
+        tau: int | None = None,
     ):
         self.data = np.load(path, mmap_mode='r')
         self.observations = self.data['observations']
@@ -117,6 +126,7 @@ class AdvantageDataset:
         self.chunk_size = int(self.data['chunk_size']) if 'chunk_size' in self.data else 1
         self.task = task
         self.gamma = gamma
+        self.tau = self.chunk_size - 1 if tau is None else int(tau)
 
         if self.chunk_mode:
             chunks = self.data['action_chunks']
@@ -125,7 +135,10 @@ class AdvantageDataset:
             self.act_dim = self.data['actions'].shape[1]
 
         if task == 'classifier':
-            all_indices, all_labels = build_samples(self.episode_ends, self.distance, self.chunk_mode)
+            all_indices, all_labels = build_samples(
+                self.episode_ends, self.distance, self.chunk_mode,
+                horizon=self.chunk_size, tau=self.tau,
+            )
         elif task == 'regression':
             all_indices, all_labels = build_regression_samples(
                 self.episode_ends, self.distance, self.chunk_mode, gamma
@@ -170,13 +183,14 @@ def make_train_val(
     seed: int,
     task: str = 'classifier',
     gamma: float = 0.99,
+    tau: int | None = None,
 ) -> tuple[AdvantageDataset, AdvantageDataset]:
     data = np.load(path, allow_pickle=False)
     num_episodes = len(data['episode_ends'])
     train_eps, val_eps = split_episodes(num_episodes, val_ratio, seed)
     return (
-        AdvantageDataset(path, train_eps, task=task, gamma=gamma),
-        AdvantageDataset(path, val_eps, task=task, gamma=gamma),
+        AdvantageDataset(path, train_eps, task=task, gamma=gamma, tau=tau),
+        AdvantageDataset(path, val_eps, task=task, gamma=gamma, tau=tau),
     )
 
 

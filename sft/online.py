@@ -2,7 +2,8 @@
 
 Round k:
   1. Collect episodes with the current flow policy pi_k (pi_0 = pretrained GCBC).
-  2. Oracle-label each action chunk: y=1 if d(s_{t+H}) < d(s_t), else 0.
+  2. Oracle-label each action chunk: y=1 if d(s) - d(s') >= H - tau, else 0.
+     Default tau = H - 1 ⇒ threshold 1 (same as strict improve).
   3. Keep only y=1 chunks and continue flow-BC training → pi_{k+1}.
 
 Positive chunks accumulate across rounds by default (true filtered BC, not AWR).
@@ -199,9 +200,18 @@ def label_and_filter(
     max_oracle_steps: int,
     warmup_steps: int,
     goal_condition: bool,
+    tau: int | None = None,
 ) -> tuple[dict, dict]:
-    """Oracle-label chunks; return (stats, filtered flow-BC batch dict of positives only)."""
+    """Oracle-label chunks; return (stats, filtered flow-BC batch dict of positives only).
+
+    Positive if d(s) - d(s') >= H - tau (default tau=H-1 ⇒ need improve by >= 1).
+    """
     from awr.classifier.ogbench_dataset import episode_ends as ends_from_terminals
+    from awr.oracle_utils import progress_label
+
+    if tau is None:
+        tau = chunk_size - 1
+    threshold = chunk_size - tau
 
     n = len(rollout['observations'])
     terminals = np.zeros(n, np.float32)
@@ -244,8 +254,7 @@ def label_and_filter(
         t = start
         while t + chunk_size < end:
             n_total += 1
-            improved = distance[t + chunk_size] < distance[t]
-            if improved:
+            if progress_label(distance[t], distance[t + chunk_size], chunk_size, tau) > 0.5:
                 n_pos += 1
                 chunk = rollout['actions'][t : t + chunk_size]
                 obs_list.append(rollout['observations'][t])
@@ -260,6 +269,8 @@ def label_and_filter(
         'num_chunks': n_total,
         'num_positive': n_pos,
         'improve_frac': float(n_pos / max(n_total, 1)),
+        'tau': int(tau),
+        'threshold': int(threshold),
     }
     if n_pos == 0:
         empty = {
@@ -353,6 +364,8 @@ def main():
     p.add_argument('--num_workers', type=int, default=10, help='Parallel oracle-label workers')
     p.add_argument('--max_oracle_steps', type=int, default=200)
     p.add_argument('--warmup_steps', type=int, default=2)
+    p.add_argument('--tau', type=int, default=None,
+                   help='Progress slack: y=1 iff d(s)-d(s\') >= H-tau. Default tau=H-1 (threshold 1)')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--no_accumulate', action='store_true',
                    help='Train each round only on that round\'s positives (default: accumulate)')
@@ -384,6 +397,7 @@ def main():
     act_dim = int(meta['act_dim'])
     goal_condition = bool(meta['goal_condition'])
     apply_fn = model.apply
+    tau = chunk_size - 1 if args.tau is None else int(args.tau)
 
     env = gymnasium.make(env_name)
     max_steps = args.max_steps or env.spec.max_episode_steps
@@ -392,8 +406,10 @@ def main():
 
     print(
         f'Filtered BC | env={env_name} task={args.task_id} ({task_name}) '
-        f'chunk={chunk_size} rounds={args.rounds} eps/round={args.episodes_per_round}'
+        f'chunk={chunk_size} tau={tau} (threshold={chunk_size - tau}) '
+        f'rounds={args.rounds} eps/round={args.episodes_per_round}'
     )
+    wandb.config.update({'tau': tau, 'progress_threshold': chunk_size - tau}, allow_val_change=True)
 
     buffers: list[dict] = []
 
@@ -413,11 +429,12 @@ def main():
 
         stats, filtered = label_and_filter(
             rollout, goal_xyz, chunk_size, act_dim, args.num_workers,
-            args.max_oracle_steps, args.warmup_steps, goal_condition,
+            args.max_oracle_steps, args.warmup_steps, goal_condition, tau=tau,
         )
         print(
             f'round {k}: chunks={stats["num_chunks"]} '
-            f'positives={stats["num_positive"]} improve_frac={stats["improve_frac"]:.3f}'
+            f'positives={stats["num_positive"]} improve_frac={stats["improve_frac"]:.3f} '
+            f'(tau={stats["tau"]}, thr={stats["threshold"]})'
         )
 
         if stats['num_positive'] == 0:
@@ -428,6 +445,8 @@ def main():
                 'label/improve_frac': stats['improve_frac'],
                 'label/num_chunks': stats['num_chunks'],
                 'label/num_positive': 0,
+                'label/tau': stats['tau'],
+                'label/threshold': stats['threshold'],
                 'dataset/size': sum(len(b['observations']) for b in buffers),
                 'eval/success_rate': collect_sr,
             }, step=k)
@@ -458,6 +477,8 @@ def main():
             'label/improve_frac': stats['improve_frac'],
             'label/num_chunks': stats['num_chunks'],
             'label/num_positive': stats['num_positive'],
+            'label/tau': stats['tau'],
+            'label/threshold': stats['threshold'],
             'dataset/size': len(data['observations']),
             'train/loss': last_loss,
             'eval/success_rate': eval_sr,

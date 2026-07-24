@@ -2,11 +2,11 @@
 #SBATCH --job-name=sft_filtered_bc_offline
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_normal
+#SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=60G
 #SBATCH --time=48:00:00
 #SBATCH --array=0-19

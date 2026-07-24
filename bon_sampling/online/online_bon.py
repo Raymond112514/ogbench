@@ -97,7 +97,7 @@ def annotate_round(raw_path, annotated_path, num_workers, max_oracle_steps, warm
     return float(distance.mean())
 
 
-def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ratio, seed, eval_interval):
+def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ratio, seed, eval_interval, tau=None):
     """Fit classifier; write a temp pickle for BoN workers only (not archived)."""
     import pickle
 
@@ -111,7 +111,7 @@ def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ra
     from bon_sampling.advantage.model import AdvantageClassifier
     from bon_sampling.advantage.train import eval_dataset, sample_batch, train_step
 
-    train_data, val_data = make_train_val(str(data_path), val_ratio, seed)
+    train_data, val_data = make_train_val(str(data_path), val_ratio, seed, tau=tau)
     chunk_size = train_data.chunk_size if train_data.chunk_mode else 1
     obs_dim = train_data.observations.shape[1]
     act_dim = train_data.act_dim
@@ -187,6 +187,7 @@ def eval_classifier_fresh(
     warmup_steps: int,
     batch_size: int,
     tmp_dir: Path,
+    tau: int | None = None,
 ) -> dict[str, float]:
     """Collect fresh GCBC episodes, oracle-label, score classifier accuracy/precision/recall."""
     import pickle
@@ -205,7 +206,7 @@ def eval_classifier_fresh(
     )
     annotate_round(raw_path, ann_path, num_workers, max_oracle_steps, warmup_steps)
 
-    data = AdvantageDataset(str(ann_path), episode_ids=None, task='classifier')
+    data = AdvantageDataset(str(ann_path), episode_ids=None, task='classifier', tau=tau)
     if len(data) == 0:
         return {
             'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0,
@@ -250,6 +251,8 @@ def main():
     p.add_argument('--bon_n', type=int, default=8)
     p.add_argument('--max_oracle_steps', type=int, default=200)
     p.add_argument('--warmup_steps', type=int, default=2)
+    p.add_argument('--tau', type=int, default=None,
+                   help='Progress slack: y=1 iff d(s)-d(s\') >= H-tau. Default tau=H-1 (threshold 1)')
     p.add_argument('--train_steps', type=int, default=5000)
     p.add_argument('--batch_size', type=int, default=256)
     p.add_argument('--lr', type=float, default=3e-4)
@@ -315,14 +318,17 @@ def main():
                 merge_annotated([str(p) for p in train_paths], str(merged))
                 ckpt_path, metrics = train_classifier(
                     merged, reranker_path, args.train_steps, args.batch_size, args.lr, args.hidden,
-                    args.val_ratio, args.seed, args.eval_interval,
+                    args.val_ratio, args.seed, args.eval_interval, tau=args.tau,
                 )
                 log['collect/mean_oracle_distance'] = mean_distance
+                log['label/tau'] = chunk_size - 1 if args.tau is None else int(args.tau)
+                log['label/threshold'] = chunk_size - log['label/tau']
 
                 clf_m = eval_classifier_fresh(
                     args.checkpoint, args.env_name, args.task_id, args.eval_clf_episodes,
                     args.num_workers, args.n_flow_steps, args.bon_n, ckpt_path,
                     args.max_oracle_steps, args.warmup_steps, args.batch_size, tmp_dir,
+                    tau=args.tau,
                 )
                 log.update({f'eval_clf/{k}': v for k, v in clf_m.items()})
                 print(

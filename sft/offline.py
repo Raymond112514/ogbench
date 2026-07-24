@@ -1,7 +1,8 @@
 """Offline filtered BC: collect once, oracle-filter, then train with periodic eval.
 
   1. Collect --num_episodes with the frozen GCBC flow policy.
-  2. Oracle-label chunks (y=1 if d(s_{t+H}) < d(s_t)); keep only positives.
+  2. Oracle-label chunks (y=1 if d(s)-d(s') >= H-tau; default tau=H-1 ⇒ threshold 1);
+     keep only positives.
   3. Fine-tune flow-BC for --train_steps, evaluating every --eval_interval steps.
 
 No checkpoints are saved (metrics via wandb).
@@ -205,6 +206,8 @@ def main():
     p.add_argument('--num_workers', type=int, default=10, help='Parallel oracle-label workers')
     p.add_argument('--max_oracle_steps', type=int, default=200)
     p.add_argument('--warmup_steps', type=int, default=2)
+    p.add_argument('--tau', type=int, default=None,
+                   help='Progress slack: y=1 iff d(s)-d(s\') >= H-tau. Default tau=H-1 (threshold 1)')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--egl_device', type=int, default=None)
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu')
@@ -238,6 +241,7 @@ def main():
     act_dim = int(meta['act_dim'])
     goal_condition = bool(meta['goal_condition'])
     apply_fn = model.apply
+    tau = chunk_size - 1 if args.tau is None else int(args.tau)
 
     tmp_env = gymnasium.make(env_name)
     max_steps = args.max_steps or tmp_env.spec.max_episode_steps
@@ -247,9 +251,10 @@ def main():
 
     print(
         f'Offline filtered BC | env={env_name} task={args.task_id} ({task_name}) '
-        f'chunk={chunk_size} episodes={args.num_episodes} '
-        f'train_steps={args.train_steps} eval_every={args.eval_interval}'
+        f'chunk={chunk_size} tau={tau} (threshold={chunk_size - tau}) '
+        f'episodes={args.num_episodes} train_steps={args.train_steps} eval_every={args.eval_interval}'
     )
+    wandb.config.update({'tau': tau, 'progress_threshold': chunk_size - tau}, allow_val_change=True)
 
     # 1. Collect
     print(f'collecting {args.num_episodes} episodes with {args.collect_workers} workers...')
@@ -264,16 +269,18 @@ def main():
     print('oracle labeling...')
     stats, filtered = label_and_filter(
         rollout, goal_xyz, chunk_size, act_dim, args.num_workers,
-        args.max_oracle_steps, args.warmup_steps, goal_condition,
+        args.max_oracle_steps, args.warmup_steps, goal_condition, tau=tau,
     )
     print(
         f'labeled: chunks={stats["num_chunks"]} positives={stats["num_positive"]} '
-        f'improve_frac={stats["improve_frac"]:.3f}'
+        f'improve_frac={stats["improve_frac"]:.3f} (tau={stats["tau"]}, thr={stats["threshold"]})'
     )
     wandb.log({
         'label/num_chunks': stats['num_chunks'],
         'label/num_positive': stats['num_positive'],
         'label/improve_frac': stats['improve_frac'],
+        'label/tau': stats['tau'],
+        'label/threshold': stats['threshold'],
         'dataset/size': stats['num_positive'],
     }, step=0)
 
