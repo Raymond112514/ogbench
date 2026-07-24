@@ -3,9 +3,8 @@
 Requires an npz produced by awr/annotate_ogbench.py (ideally --data_percent 100 so that
 `distance` is available contiguously for every transition within each episode).
 
-Label for a chunk starting at t: 1.0 if s_{t+chunk_size} improved over s_t, i.e. the oracle
-distance decreased (progress), else 0.0. Chunks that would cross an episode boundary are
-dropped (no valid same-episode oracle label for s_{t+chunk_size}).
+Label for a chunk starting at t: 1.0 if d(s_t) - d(s_{t+H}) >= H - tau (default tau=H-1 ⇒
+threshold 1), else 0.0. Chunks that would cross an episode boundary are dropped.
 """
 
 from __future__ import annotations
@@ -26,8 +25,11 @@ def build_chunk_progress(
     terminals: np.ndarray,
     distance: np.ndarray,
     chunk_size: int,
+    tau: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Chunk-level (observation, flattened action chunk, progress label) samples."""
+    from awr.oracle_utils import progress_label
+
     n = len(observations)
     ends = episode_ends(terminals, n)
     obs_list, act_list, label_list = [], [], []
@@ -37,7 +39,9 @@ def build_chunk_progress(
         while t + chunk_size < end:  # need s_{t+chunk_size} in the same episode
             obs_list.append(observations[t])
             act_list.append(actions[t : t + chunk_size].reshape(-1))
-            label_list.append(1.0 if distance[t + chunk_size] < distance[t] else 0.0)
+            label_list.append(
+                progress_label(distance[t], distance[t + chunk_size], chunk_size, tau)
+            )
             t += chunk_size
         start = end
     return (
@@ -57,7 +61,9 @@ class ClassifierOgbenchDataset:
         self.act_dim = actions.shape[1]
 
     @classmethod
-    def from_annotated(cls, annotated: dict, chunk_size: int = 4) -> 'ClassifierOgbenchDataset':
+    def from_annotated(
+        cls, annotated: dict, chunk_size: int = 4, tau: int | None = None,
+    ) -> 'ClassifierOgbenchDataset':
         for k in ('observations', 'actions', 'terminals', 'distance'):
             if k not in annotated:
                 raise ValueError(f'oracle-annotated data missing key {k!r}')
@@ -67,6 +73,7 @@ class ClassifierOgbenchDataset:
             np.asarray(annotated['terminals']).reshape(-1),
             np.asarray(annotated['distance']),
             chunk_size,
+            tau=tau,
         )
         if len(obs) == 0:
             raise ValueError('no chunk-progress samples built; check chunk_size vs. episode length')

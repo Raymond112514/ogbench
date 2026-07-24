@@ -26,6 +26,23 @@ def oracle_seed(mjstate):
     return int(np.abs(np.sum(mjstate[:32] * 1000)).astype(np.int64) % (2**31))
 
 
+def progress_label(d_t, d_next, horizon: int, tau: int | None = None) -> float:
+    """Binary progress: 1 if d(s) - d(s') >= H - tau.
+
+    Default tau = H - 1 ⇒ threshold 1 (same as strict d(s') < d(s) when distances are ints).
+    """
+    h = int(horizon)
+    if h < 1:
+        raise ValueError(f'horizon must be >= 1, got {h}')
+    if tau is None:
+        tau = h - 1
+    tau = int(tau)
+    if not (0 <= tau < h):
+        raise ValueError(f'tau must be in [0, H), got tau={tau} H={h}')
+    threshold = h - tau
+    return 1.0 if (int(d_t) - int(d_next)) >= threshold else 0.0
+
+
 def capture_sim_state(env):
     u = env.unwrapped
     return get_sim_state(u._model, u._data)
