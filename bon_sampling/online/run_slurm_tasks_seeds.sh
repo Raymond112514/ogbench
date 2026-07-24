@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=online_bon_sweep
+#SBATCH --job-name=online_bon
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
 #SBATCH --qos=rail_gpu4_normal
@@ -8,15 +8,14 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=60G
-#SBATCH --time=24:00:00
-#SBATCH --array=0-5
+#SBATCH --time=48:00:00
+#SBATCH --array=0-19
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 
-# Online BoN: methods {classifier, iql} x task_id {1, 2, 3}.
-# Fit steps=2000, rounds=30.
+# Online BoN (classifier). No persistent checkpoints — wandb only.
+# Array: task_id {1,2,3,4,5} x seed {0,10,100,1000} = 20 runs.
 
-# --- env ---
 source ~/.bashrc
 conda activate ogbench
 
@@ -26,38 +25,35 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-# --- config ---
 REPO_DIR="${REPO_DIR:-$HOME/ogbench}"
-CHECKPOINT="${CHECKPOINT:-flow_bc/checkpoints/cube_single_gcbc/best.pkl}"
+CHECKPOINT="${CHECKPOINT:-flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl}"
 ENV_NAME="${ENV_NAME:-cube-single-v0}"
-TRAIN_STEPS=2000
-ROUNDS=30
-EPISODES=100
-NUM_WORKERS=10
-BON_N=8
-WANDB_PROJECT="${WANDB_PROJECT:-bon-online}"
+METHOD="${METHOD:-classifier}"
 
-# Flat sweep: (method, task_id)
-COMBOS=(
-  "classifier 1"
-  "classifier 2"
-  "classifier 3"
-  "iql 1"
-  "iql 2"
-  "iql 3"
-)
-read -r METHOD TASK_ID <<< "${COMBOS[$SLURM_ARRAY_TASK_ID]}"
+ROUNDS="${ROUNDS:-30}"
+EPISODES="${EPISODES:-100}"
+EVAL_CLF_EPISODES="${EVAL_CLF_EPISODES:-20}"
+NUM_WORKERS="${NUM_WORKERS:-10}"
+BON_N="${BON_N:-8}"
+TRAIN_STEPS="${TRAIN_STEPS:-2000}"
+WANDB_PROJECT="${WANDB_PROJECT:-bon-online-ac10}"
+
+TASKS=(1 2 3 4 5)
+SEEDS=(0 10 100 1000)
+TASK_ID="${TASKS[$((SLURM_ARRAY_TASK_ID / 4))]}"
+SEED="${SEEDS[$((SLURM_ARRAY_TASK_ID % 4))]}"
 
 mkdir -p "${REPO_DIR}/logs"
 cd "${REPO_DIR}"
 
+run_name="${METHOD}_ac10_task${TASK_ID}_r${ROUNDS}_bon${BON_N}_seed${SEED}"
+safe_run_name="${run_name//./p}"
+
 echo "SLURM_ARRAY_TASK_ID = ${SLURM_ARRAY_TASK_ID}"
-echo "method = ${METHOD}, task_id = ${TASK_ID}"
-echo "train_steps = ${TRAIN_STEPS}, rounds = ${ROUNDS}"
-
-run_name="${METHOD}_task${TASK_ID}_steps${TRAIN_STEPS}_r${ROUNDS}"
-safe_run_name="${run_name//\//_}"
-
+echo "method = ${METHOD}"
+echo "task_id = ${TASK_ID}"
+echo "seed = ${SEED}"
+echo "checkpoint = ${CHECKPOINT}"
 echo "Launching ${run_name}"
 
 python bon_sampling/online/online_bon.py \
@@ -67,10 +63,11 @@ python bon_sampling/online/online_bon.py \
   --task_id "${TASK_ID}" \
   --rounds "${ROUNDS}" \
   --episodes_per_round "${EPISODES}" \
+  --eval_clf_episodes "${EVAL_CLF_EPISODES}" \
   --num_workers "${NUM_WORKERS}" \
   --bon_n "${BON_N}" \
   --train_steps "${TRAIN_STEPS}" \
-  --expectile 0.9 \
+  --seed "${SEED}" \
   --device auto \
   --wandb_project "${WANDB_PROJECT}" \
   --wandb_name "${run_name}" \
@@ -78,4 +75,4 @@ python bon_sampling/online/online_bon.py \
   > "logs/${safe_run_name}_${SLURM_JOB_ID}.out" \
   2> "logs/${safe_run_name}_${SLURM_JOB_ID}.err"
 
-echo "Finished array task ${SLURM_ARRAY_TASK_ID} (method=${METHOD}, task_id=${TASK_ID})"
+echo "Finished ${run_name}"

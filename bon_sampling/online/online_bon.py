@@ -6,13 +6,13 @@
 Round 0 always collects with the plain GCBC policy. Later rounds use BoN with the previous
 round's reranker. Data collection always runs on CPU (--num_workers parallel envs).
 
-python bon_sampling/online/online_bon.py \
-  --checkpoint flow_bc/checkpoints/cube_single_gcbc/best.pkl \
-  --method classifier --rounds 30 --episodes_per_round 100 --num_workers 10 --device cpu
+No persistent checkpoints or rollout dumps — only temp files for BoN workers / labeling.
+Each round also logs classifier accuracy / precision / recall on ~20 fresh oracle-labeled
+episodes (held-out from training).
 
-python bon_sampling/online/online_bon.py \
-  --checkpoint flow_bc/checkpoints/cube_single_gcbc/best.pkl \
-  --method iql --rounds 30 --episodes_per_round 100 --num_workers 10 --device cpu
+python bon_sampling/online/online_bon.py \\
+  --checkpoint flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl \\
+  --method classifier --rounds 30 --episodes_per_round 100 --num_workers 10 --device cpu
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -51,7 +52,7 @@ def collect_round(checkpoint, env_name, task_id, n_episodes, num_workers, n_flow
         None, 'cpu', [], reranker_ckpt, 'auto', bon_n,
     )
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out_path,
         observations=np.asarray(obs, np.float32),
@@ -91,11 +92,13 @@ def annotate_round(raw_path, annotated_path, num_workers, max_oracle_steps, warm
 
     out = subsample_arrays(data, indices, chunk_size)
     out['distance'] = distance
+    Path(annotated_path).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(annotated_path, **out)
     return float(distance.mean())
 
 
 def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ratio, seed, eval_interval):
+    """Fit classifier; write a temp pickle for BoN workers only (not archived)."""
     import pickle
 
     import jax
@@ -131,7 +134,6 @@ def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ra
                 best_val_acc, best_val_loss = val_m['accuracy'], val_m['loss']
                 best_params, best_step = state.params, step
 
-    # Temp file for BoN workers only (overwritten each round; not archived).
     Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
     with open(ckpt_path, 'wb') as f:
         pickle.dump(
@@ -149,15 +151,101 @@ def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ra
     return str(ckpt_path), {'val_acc': best_val_acc, 'val_loss': best_val_loss}
 
 
+def _prf(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    y_true = np.asarray(y_true).astype(np.float32).reshape(-1)
+    y_pred = np.asarray(y_pred).astype(np.float32).reshape(-1)
+    tp = float(np.sum((y_pred == 1) & (y_true == 1)))
+    fp = float(np.sum((y_pred == 1) & (y_true == 0)))
+    fn = float(np.sum((y_pred == 0) & (y_true == 1)))
+    tn = float(np.sum((y_pred == 0) & (y_true == 0)))
+    acc = float(np.mean(y_pred == y_true)) if len(y_true) else 0.0
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return {
+        'accuracy': acc,
+        'precision': prec,
+        'recall': rec,
+        'tp': tp,
+        'fp': fp,
+        'fn': fn,
+        'tn': tn,
+        'num_samples': float(len(y_true)),
+        'label_pos_rate': float(np.mean(y_true)) if len(y_true) else 0.0,
+    }
+
+
+def eval_classifier_fresh(
+    policy_ckpt: str,
+    env_name: str,
+    task_id: int,
+    n_episodes: int,
+    num_workers: int,
+    n_flow_steps: int,
+    bon_n: int,
+    classifier_ckpt: str,
+    max_oracle_steps: int,
+    warmup_steps: int,
+    batch_size: int,
+    tmp_dir: Path,
+) -> dict[str, float]:
+    """Collect fresh GCBC episodes, oracle-label, score classifier accuracy/precision/recall."""
+    import pickle
+
+    import jax.numpy as jnp
+
+    from bon_sampling.advantage.dataset import AdvantageDataset
+    from bon_sampling.advantage.model import AdvantageClassifier
+
+    raw_path = tmp_dir / 'eval_fresh_raw.npz'
+    ann_path = tmp_dir / 'eval_fresh_annotated.npz'
+
+    collect_round(
+        policy_ckpt, env_name, task_id, n_episodes, num_workers, n_flow_steps,
+        None, bon_n, raw_path,  # plain GCBC: held-out (s,a), not BoN-selected
+    )
+    annotate_round(raw_path, ann_path, num_workers, max_oracle_steps, warmup_steps)
+
+    data = AdvantageDataset(str(ann_path), episode_ids=None, task='classifier')
+    if len(data) == 0:
+        return {
+            'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0,
+            'num_samples': 0.0, 'label_pos_rate': 0.0,
+        }
+
+    with open(classifier_ckpt, 'rb') as f:
+        ckpt = pickle.load(f)
+    model = AdvantageClassifier(hidden=ckpt['hidden'])
+    params = ckpt['params']
+
+    preds, labels = [], []
+    for start in range(0, len(data), batch_size):
+        sel = np.arange(start, min(start + batch_size, len(data)))
+        batch = data.get_batch(sel)
+        logits = model.apply(
+            params,
+            jnp.asarray(batch['observations']),
+            jnp.asarray(batch['actions']),
+        )
+        pred = (np.asarray(logits) >= 0.0).astype(np.float32)
+        preds.append(pred)
+        labels.append(batch['labels'])
+
+    y_pred = np.concatenate(preds, axis=0)
+    y_true = np.concatenate(labels, axis=0)
+    return _prf(y_true, y_pred)
+
+
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--checkpoint', default='flow_bc/checkpoints/cube_single_gcbc/best.pkl')
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--checkpoint', default='flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl')
     p.add_argument('--method', choices=['classifier', 'iql'], default='classifier')
     p.add_argument('--env_name', default='cube-single-v0')
     p.add_argument('--task_id', type=int, default=1)
     p.add_argument('--n_flow_steps', type=int, default=10)
     p.add_argument('--rounds', type=int, default=30)
     p.add_argument('--episodes_per_round', type=int, default=100)
+    p.add_argument('--eval_clf_episodes', type=int, default=20,
+                   help='Fresh episodes for held-out classifier metrics each round')
     p.add_argument('--num_workers', type=int, default=10)
     p.add_argument('--bon_n', type=int, default=8)
     p.add_argument('--max_oracle_steps', type=int, default=200)
@@ -172,7 +260,6 @@ def main():
     p.add_argument('--expectile', type=float, default=0.9, help='IQL expectile (ignored for classifier)')
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu',
                    help='JAX backend for training; data collection is always CPU')
-    p.add_argument('--output_dir', default='bon_sampling/data/online')
     p.add_argument('--wandb_project', default='bon-online')
     p.add_argument('--wandb_name', default=None, help='Wandb run name')
     p.add_argument('--wandb_mode', choices=['online', 'offline', 'disabled'], default='online')
@@ -181,7 +268,7 @@ def main():
     if args.device == 'cpu':
         os.environ['JAX_PLATFORMS'] = 'cpu'
 
-    import tempfile
+    import shutil
 
     import wandb
 
@@ -194,12 +281,13 @@ def main():
 
     reranker_ckpt = None
     train_paths: list[Path] = []
-    tmp_dir = Path(tempfile.mkdtemp(prefix='bon_reranker_'))
+    tmp_dir = Path(tempfile.mkdtemp(prefix='bon_online_'))
     reranker_path = tmp_dir / 'reranker.pkl'
 
     try:
         for r in range(args.rounds):
-            round_dir = Path(args.output_dir) / args.method / f'round{r}'
+            round_dir = tmp_dir / f'round{r}'
+            round_dir.mkdir(parents=True, exist_ok=True)
             raw_path = round_dir / 'rollouts.npz'
             annotated_path = round_dir / 'annotated.npz'
 
@@ -223,13 +311,26 @@ def main():
                 train_paths.append(annotated_path)
                 from bon_sampling.advantage.dataset import merge_annotated
 
-                merged = round_dir / 'annotated_all.npz'
+                merged = tmp_dir / 'annotated_all.npz'
                 merge_annotated([str(p) for p in train_paths], str(merged))
                 ckpt_path, metrics = train_classifier(
                     merged, reranker_path, args.train_steps, args.batch_size, args.lr, args.hidden,
                     args.val_ratio, args.seed, args.eval_interval,
                 )
                 log['collect/mean_oracle_distance'] = mean_distance
+
+                clf_m = eval_classifier_fresh(
+                    args.checkpoint, args.env_name, args.task_id, args.eval_clf_episodes,
+                    args.num_workers, args.n_flow_steps, args.bon_n, ckpt_path,
+                    args.max_oracle_steps, args.warmup_steps, args.batch_size, tmp_dir,
+                )
+                log.update({f'eval_clf/{k}': v for k, v in clf_m.items()})
+                print(
+                    f'round {r} [classifier]: success={success_rate:.3f} '
+                    f'clf_acc={clf_m["accuracy"]:.3f} prec={clf_m["precision"]:.3f} '
+                    f'recall={clf_m["recall"]:.3f} (n={int(clf_m["num_samples"])})',
+                    flush=True,
+                )
             else:
                 train_paths.append(raw_path)
                 from bon_sampling.iql.train import train_iql
@@ -238,15 +339,13 @@ def main():
                     train_paths, reranker_path, args.train_steps, seed=args.seed,
                     batch_size=args.batch_size, chunk_size=chunk_size, expectile=args.expectile,
                 )
+                print(f'round {r} [iql]: success_rate={success_rate:.3f}', flush=True)
 
             log['train/num_datasets'] = len(train_paths)
             log.update({f'train/{k}': v for k, v in metrics.items()})
             wandb.log(log)
-            print(f'round {r} [{args.method}]: success_rate={success_rate:.3f}')
             reranker_ckpt = ckpt_path
     finally:
-        import shutil
-
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     wandb.finish()
