@@ -1,4 +1,4 @@
-"""Online advantage-conditioned flow-BC (oracle-binarized A, CFG eval).
+"""Online advantage-conditioned flow-BC with oracle or learned classifier labels.
 
 Single-task: goal_condition=False, advantage_condition=True (cond = [obs, A]).
 
@@ -6,7 +6,8 @@ Round k (default 30):
   1. Collect N episodes.
        k=0: frozen GCBC (goal-cond) for data only.
        k>0: current adv-cond policy with CFG requesting A=1.
-  2. Oracle-label chunk boundaries; A = 1[d(s)-d(s') >= H-tau] (default tau=H-1).
+  2. Set binary A using oracle progress, or threshold a classifier trained to
+     distinguish chunks from successful vs failed episodes.
   3. Accumulate (s, chunk, A) over all rounds; take a few flow grad steps with CFG dropout.
   4. Eval success at guidance scales {0, 0.25, 0.5, 0.75, 1, 2, 3} (request A=1).
 
@@ -409,6 +410,13 @@ def main():
     p.add_argument('--warmup_steps', type=int, default=2)
     p.add_argument('--tau', type=int, default=None,
                    help='A=1 iff d(s)-d(s\') >= H-tau. Default tau=H-1')
+    p.add_argument('--feedback', choices=['oracle', 'success_classifier'], default='oracle')
+    p.add_argument('--classifier_tau', type=float, default=0.5,
+                   help='Success-classifier probability threshold (default: 0.5)')
+    p.add_argument('--classifier_steps', type=int, default=2000)
+    p.add_argument('--classifier_batch_size', type=int, default=256)
+    p.add_argument('--classifier_lr', type=float, default=3e-4)
+    p.add_argument('--classifier_hidden', type=int, default=256)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu')
     p.add_argument('--wandb_project', default='adv-cond-online')
@@ -458,6 +466,7 @@ def main():
             'chunk_size': chunk_size,
             'tau': tau,
             'progress_threshold': chunk_size - tau,
+            'classifier_tau': args.classifier_tau,
             'cfg_scales': list(CFG_SCALES),
             'task_name': task_name,
             'env_name': env_name,
@@ -472,9 +481,12 @@ def main():
     )
 
     buffers: list[dict] = []
+    classifier_buffers: list[dict] = []
+    classifier_params = None
+    adv_policy_trained = False
 
     for k in range(args.rounds):
-        if k == 0:
+        if not adv_policy_trained:
             rollout, collect_sr = collect_gcbc_round(
                 args.policy_ckpt, env_name, args.task_id, args.episodes_per_round,
                 args.num_workers, args.n_flow_steps,
@@ -491,10 +503,62 @@ def main():
 
         print(f'round {k}: collect={collect_mode} success={collect_sr:.3f}', flush=True)
 
-        stats, labeled = label_chunks(
-            rollout, goal_xyz, chunk_size, args.num_workers,
-            args.max_oracle_steps, args.warmup_steps, tau,
-        )
+        classifier_metrics = {}
+        if args.feedback == 'oracle':
+            stats, labeled = label_chunks(
+                rollout, goal_xyz, chunk_size, args.num_workers,
+                args.max_oracle_steps, args.warmup_steps, tau,
+            )
+        else:
+            from bon_sampling.advantage.success_feedback import (
+                build_episode_success_chunks,
+                merge_success_chunks,
+                predict_success_probabilities,
+                threshold_success_feedback,
+                train_success_classifier,
+            )
+
+            current_chunks = build_episode_success_chunks(rollout, chunk_size)
+            classifier_buffers.append(current_chunks)
+            classifier_data = merge_success_chunks(classifier_buffers)
+            classifier_params, classifier_metrics = train_success_classifier(
+                classifier_params,
+                classifier_data,
+                hidden=args.classifier_hidden,
+                train_steps=args.classifier_steps,
+                batch_size=args.classifier_batch_size,
+                lr=args.classifier_lr,
+                seed=args.seed + k,
+            )
+            if classifier_params is None:
+                print(
+                    f'round {k}: success classifier needs both successful and failed episodes; '
+                    'skipping adv-cond update',
+                    flush=True,
+                )
+                wandb.log({
+                    'round': k,
+                    'collect/success_rate': collect_sr,
+                    **{f'classifier/{key}': value for key, value in classifier_metrics.items()},
+                }, step=k)
+                continue
+            probabilities = predict_success_probabilities(
+                classifier_params,
+                current_chunks,
+                hidden=args.classifier_hidden,
+                batch_size=args.classifier_batch_size,
+            )
+            labeled, predicted_stats = threshold_success_feedback(
+                current_chunks, probabilities, args.classifier_tau
+            )
+            stats = {
+                'num_chunks': int(predicted_stats['num_chunks']),
+                'num_positive': int(predicted_stats['num_positive']),
+                'improve_frac': predicted_stats['positive_frac'],
+                'tau': predicted_stats['threshold'],
+                'threshold': predicted_stats['threshold'],
+                'mean_probability': predicted_stats['mean_probability'],
+            }
         print(
             f'round {k}: chunks={stats["num_chunks"]} pos={stats["num_positive"]} '
             f'improve_frac={stats["improve_frac"]:.3f}',
@@ -514,6 +578,7 @@ def main():
             seed=args.seed + k,
             cfg_dropout=args.cfg_dropout,
         )
+        adv_policy_trained = True
 
         log = {
             'round': k,
@@ -524,6 +589,8 @@ def main():
             'label/improve_frac': stats['improve_frac'],
             'label/tau': stats['tau'],
             'label/threshold': stats['threshold'],
+            'label/mean_probability': stats.get('mean_probability', 0.0),
+            **{f'classifier/{key}': value for key, value in classifier_metrics.items()},
             'dataset/size': len(data['observations']),
             'dataset/pos_rate': float(np.mean(data['advantages'])),
             'train/loss': last_loss,

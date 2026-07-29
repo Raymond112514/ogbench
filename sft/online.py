@@ -1,9 +1,9 @@
-"""Filtered BC online loop: keep flow-GCBC, fine-tune only on oracle-improved chunks.
+"""Filtered BC online loop with oracle or learned success-classifier feedback.
 
 Round k:
   1. Collect episodes with the current flow policy pi_k (pi_0 = pretrained GCBC).
-  2. Oracle-label each action chunk: y=1 if d(s) - d(s') >= H - tau, else 0.
-     Default tau = H - 1 ⇒ threshold 1 (same as strict improve).
+  2. Label each action chunk using oracle progress, or threshold a classifier trained
+     to distinguish chunks from successful vs failed episodes.
   3. Keep only y=1 chunks and continue flow-BC training → pi_{k+1}.
 
 Positive chunks accumulate across rounds by default (true filtered BC, not AWR).
@@ -297,6 +297,26 @@ def merge_filtered(buffers: list[dict]) -> dict:
     return {k: np.concatenate([b[k] for b in buffers], axis=0) for k in keys}
 
 
+def filter_classifier_chunks(
+    chunks: dict[str, np.ndarray],
+    probabilities: np.ndarray,
+    threshold: float,
+) -> tuple[dict, dict]:
+    """Keep chunks whose predicted episode-success probability clears threshold."""
+    keep = np.asarray(probabilities) >= threshold
+    keys = ('observations', 'action_chunks', 'chunk_masks', 'goals')
+    filtered = {key: chunks[key][keep] for key in keys if key in chunks}
+    stats = {
+        'num_chunks': int(len(keep)),
+        'num_positive': int(keep.sum()),
+        'improve_frac': float(keep.mean()) if len(keep) else 0.0,
+        'tau': float(threshold),
+        'threshold': float(threshold),
+        'mean_probability': float(np.mean(probabilities)) if len(probabilities) else 0.0,
+    }
+    return stats, filtered
+
+
 # ---------------------------------------------------------------------------
 # Filtered flow-BC fine-tune
 # ---------------------------------------------------------------------------
@@ -366,6 +386,13 @@ def main():
     p.add_argument('--warmup_steps', type=int, default=2)
     p.add_argument('--tau', type=int, default=None,
                    help='Progress slack: y=1 iff d(s)-d(s\') >= H-tau. Default tau=H-1 (threshold 1)')
+    p.add_argument('--feedback', choices=['oracle', 'success_classifier'], default='oracle')
+    p.add_argument('--classifier_tau', type=float, default=0.5,
+                   help='Success-classifier probability threshold (default: 0.5)')
+    p.add_argument('--classifier_steps', type=int, default=2000)
+    p.add_argument('--classifier_batch_size', type=int, default=256)
+    p.add_argument('--classifier_lr', type=float, default=3e-4)
+    p.add_argument('--classifier_hidden', type=int, default=256)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--no_accumulate', action='store_true',
                    help='Train each round only on that round\'s positives (default: accumulate)')
@@ -409,9 +436,15 @@ def main():
         f'chunk={chunk_size} tau={tau} (threshold={chunk_size - tau}) '
         f'rounds={args.rounds} eps/round={args.episodes_per_round}'
     )
-    wandb.config.update({'tau': tau, 'progress_threshold': chunk_size - tau}, allow_val_change=True)
+    wandb.config.update({
+        'tau': tau,
+        'progress_threshold': chunk_size - tau,
+        'classifier_tau': args.classifier_tau,
+    }, allow_val_change=True)
 
     buffers: list[dict] = []
+    classifier_buffers: list[dict] = []
+    classifier_params = None
 
     sr0 = evaluate_policy(
         env, params, apply_fn, meta, args.task_id, args.eval_episodes,
@@ -427,10 +460,56 @@ def main():
         )
         print(f'round {k}: collected {args.episodes_per_round} eps, success={collect_sr:.3f}')
 
-        stats, filtered = label_and_filter(
-            rollout, goal_xyz, chunk_size, act_dim, args.num_workers,
-            args.max_oracle_steps, args.warmup_steps, goal_condition, tau=tau,
-        )
+        classifier_metrics = {}
+        if args.feedback == 'oracle':
+            stats, filtered = label_and_filter(
+                rollout, goal_xyz, chunk_size, act_dim, args.num_workers,
+                args.max_oracle_steps, args.warmup_steps, goal_condition, tau=tau,
+            )
+        else:
+            from bon_sampling.advantage.success_feedback import (
+                build_episode_success_chunks,
+                merge_success_chunks,
+                predict_success_probabilities,
+                train_success_classifier,
+            )
+
+            current_chunks = build_episode_success_chunks(rollout, chunk_size)
+            classifier_buffers.append(current_chunks)
+            classifier_data = merge_success_chunks(classifier_buffers)
+            classifier_params, classifier_metrics = train_success_classifier(
+                classifier_params,
+                classifier_data,
+                hidden=args.classifier_hidden,
+                train_steps=args.classifier_steps,
+                batch_size=args.classifier_batch_size,
+                lr=args.classifier_lr,
+                seed=args.seed + k,
+            )
+            if classifier_params is None:
+                stats = {
+                    'num_chunks': len(current_chunks['observations']),
+                    'num_positive': 0,
+                    'improve_frac': 0.0,
+                    'tau': args.classifier_tau,
+                    'threshold': args.classifier_tau,
+                    'mean_probability': 0.0,
+                }
+                filtered = {
+                    key: value[:0]
+                    for key, value in current_chunks.items()
+                    if key not in ('success_labels',)
+                }
+            else:
+                probabilities = predict_success_probabilities(
+                    classifier_params,
+                    current_chunks,
+                    hidden=args.classifier_hidden,
+                    batch_size=args.classifier_batch_size,
+                )
+                stats, filtered = filter_classifier_chunks(
+                    current_chunks, probabilities, args.classifier_tau
+                )
         print(
             f'round {k}: chunks={stats["num_chunks"]} '
             f'positives={stats["num_positive"]} improve_frac={stats["improve_frac"]:.3f} '
@@ -447,6 +526,8 @@ def main():
                 'label/num_positive': 0,
                 'label/tau': stats['tau'],
                 'label/threshold': stats['threshold'],
+                'label/mean_probability': stats.get('mean_probability', 0.0),
+                **{f'classifier/{key}': value for key, value in classifier_metrics.items()},
                 'dataset/size': sum(len(b['observations']) for b in buffers),
                 'eval/success_rate': collect_sr,
             }, step=k)
@@ -479,6 +560,8 @@ def main():
             'label/num_positive': stats['num_positive'],
             'label/tau': stats['tau'],
             'label/threshold': stats['threshold'],
+            'label/mean_probability': stats.get('mean_probability', 0.0),
+            **{f'classifier/{key}': value for key, value in classifier_metrics.items()},
             'dataset/size': len(data['observations']),
             'train/loss': last_loss,
             'eval/success_rate': eval_sr,

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=adv_cond
+#SBATCH --job-name=online_bon_succ
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
 #SBATCH --qos=rail_gpu4_high
@@ -9,12 +9,12 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=60G
 #SBATCH --time=48:00:00
-#SBATCH --array=0-29
+#SBATCH --array=0-14
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 
-# Online advantage-conditioned flow-BC.
-# Array: task_id {1,2,3,4,5} x seed {0,10,100} x tau {5,7} = 30 runs.
+# Online BoN with success/failure episode classifier (no oracle).
+# Array: task_id {1,2,3,4,5} x seed {0,10,100} = 15 runs.
 
 source ~/.bashrc
 conda activate ogbench
@@ -26,48 +26,43 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 REPO_DIR="${REPO_DIR:-$HOME/ogbench}"
-POLICY_CKPT="${POLICY_CKPT:-flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl}"
+CHECKPOINT="${CHECKPOINT:-flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl}"
+ENV_NAME="${ENV_NAME:-cube-single-v0}"
 
 ROUNDS="${ROUNDS:-30}"
 EPISODES="${EPISODES:-100}"
-EVAL_EPISODES="${EVAL_EPISODES:-50}"
-TRAIN_STEPS="${TRAIN_STEPS:-5000}"
+EVAL_CLF_EPISODES="${EVAL_CLF_EPISODES:-20}"
 NUM_WORKERS="${NUM_WORKERS:-10}"
-CFG_DROPOUT="${CFG_DROPOUT:-0.1}"
-WANDB_PROJECT="${WANDB_PROJECT:-adv-cond-online}"
+BON_N="${BON_N:-8}"
+TRAIN_STEPS="${TRAIN_STEPS:-2000}"
+WANDB_PROJECT="${WANDB_PROJECT:-bon-online-success}"
 
 TASKS=(1 2 3 4 5)
 SEEDS=(0 10 100)
-TAUS=(5 7)
-N_SEEDS=${#SEEDS[@]}
-N_TAUS=${#TAUS[@]}
-
-TASK_ID="${TASKS[$((SLURM_ARRAY_TASK_ID / (N_SEEDS * N_TAUS)))]}"
-SEED="${SEEDS[$(((SLURM_ARRAY_TASK_ID / N_TAUS) % N_SEEDS))]}"
-TAU="${TAUS[$((SLURM_ARRAY_TASK_ID % N_TAUS))]}"
+TASK_ID="${TASKS[$((SLURM_ARRAY_TASK_ID / 3))]}"
+SEED="${SEEDS[$((SLURM_ARRAY_TASK_ID % 3))]}"
 
 mkdir -p "${REPO_DIR}/logs"
 cd "${REPO_DIR}"
 
-run_name="adv_cond_task${TASK_ID}_tau${TAU}_r${ROUNDS}_seed${SEED}"
+run_name="success_bon_ac10_task${TASK_ID}_r${ROUNDS}_bon${BON_N}_seed${SEED}"
 safe_run_name="${run_name//./p}"
 
 echo "SLURM_ARRAY_TASK_ID = ${SLURM_ARRAY_TASK_ID}"
 echo "task_id = ${TASK_ID}"
 echo "seed = ${SEED}"
-echo "tau = ${TAU}"
 echo "Launching ${run_name}"
 
-python adv_cond/online.py \
-  --policy_ckpt "${POLICY_CKPT}" \
+python bon_sampling/online/online_success_bon.py \
+  --checkpoint "${CHECKPOINT}" \
+  --env_name "${ENV_NAME}" \
   --task_id "${TASK_ID}" \
   --rounds "${ROUNDS}" \
   --episodes_per_round "${EPISODES}" \
-  --eval_episodes "${EVAL_EPISODES}" \
-  --train_steps "${TRAIN_STEPS}" \
+  --eval_clf_episodes "${EVAL_CLF_EPISODES}" \
   --num_workers "${NUM_WORKERS}" \
-  --cfg_dropout "${CFG_DROPOUT}" \
-  --tau "${TAU}" \
+  --bon_n "${BON_N}" \
+  --train_steps "${TRAIN_STEPS}" \
   --seed "${SEED}" \
   --device auto \
   --wandb_project "${WANDB_PROJECT}" \
