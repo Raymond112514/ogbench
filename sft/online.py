@@ -302,8 +302,8 @@ def filter_classifier_chunks(
     probabilities: np.ndarray,
     threshold: float,
 ) -> tuple[dict, dict]:
-    """Keep chunks whose predicted episode-success probability clears threshold."""
-    keep = np.asarray(probabilities) >= threshold
+    """Keep chunks whose predicted episode-success probability is above threshold."""
+    keep = np.asarray(probabilities) > threshold
     keys = ('observations', 'action_chunks', 'chunk_masks', 'goals')
     filtered = {key: chunks[key][keep] for key in keys if key in chunks}
     stats = {
@@ -388,7 +388,7 @@ def main():
                    help='Progress slack: y=1 iff d(s)-d(s\') >= H-tau. Default tau=H-1 (threshold 1)')
     p.add_argument('--feedback', choices=['oracle', 'success_classifier'], default='oracle')
     p.add_argument('--classifier_tau', type=float, default=0.5,
-                   help='Success-classifier probability threshold (default: 0.5)')
+                   help='Set target=1 iff P(success|s,a) > tau (default: 0.5)')
     p.add_argument('--classifier_steps', type=int, default=2000)
     p.add_argument('--classifier_batch_size', type=int, default=256)
     p.add_argument('--classifier_lr', type=float, default=3e-4)
