@@ -8,12 +8,19 @@ At each replan state s:
        --select binary:   label y_i=1 if d(s)-d(s'_i) >= H-tau else 0;
                           execute uniformly at random among argmax y
                           (all positives weighted equally; if none, uniform over K)
+       --select binned:   signed uniform bins of Δ=d(s)-d(s') over [-H,H]
+                          into --num_bins (odd) pieces; end bins absorb tails;
+                          execute uniformly among argmax ℓ
 
 Usage (from ogbench/):
   python awr/eval_oracle_lookahead.py \\
     --policy_ckpt flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl \\
     --num_episodes 50 --bon_n 8 --num_workers 10 \\
     --select binary --tau 5
+
+  python awr/eval_oracle_lookahead.py \\
+    --policy_ckpt flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl \\
+    --select binned --num_bins 5 --bon_n 8 --num_episodes 50
 """
 
 from __future__ import annotations
@@ -205,9 +212,51 @@ def select_oracle_binary(
     return int(rng.choice(pool))
 
 
-def method_name(select: str, bon_n: int, tau: int | None, horizon: int) -> str:
+def select_oracle_binned(
+    probe_env,
+    oracle_env,
+    oracle,
+    mjstate: np.ndarray,
+    goal_xyz: np.ndarray,
+    candidates: np.ndarray,
+    max_oracle_steps: int,
+    warmup_steps: int,
+    horizon: int,
+    num_bins: int,
+    rng: np.random.Generator,
+) -> int:
+    """Pick uniformly among candidates with best signed Δ-bin label."""
+    from awr.oracle_utils import delta_bin_label, oracle_distance
+
+    d_s = oracle_distance(
+        oracle_env, oracle, mjstate, max_oracle_steps,
+        warmup_steps=warmup_steps, goal_xyz=goal_xyz,
+    )
+    d_next = _candidate_distances(
+        probe_env, oracle_env, oracle, mjstate, goal_xyz, candidates,
+        max_oracle_steps, warmup_steps,
+    )
+    deltas = int(d_s) - d_next.astype(np.int32)
+    labels = np.asarray(
+        [delta_bin_label(float(delta), horizon, num_bins) for delta in deltas],
+        dtype=np.float32,
+    )
+    best = float(labels.max())
+    pool = np.flatnonzero(labels == best)
+    return int(rng.choice(pool))
+
+
+def method_name(
+    select: str,
+    bon_n: int,
+    tau: int | None,
+    horizon: int,
+    num_bins: int | None = None,
+) -> str:
     if select == 'distance':
         return f'oracle_lookahead_k{bon_n}'
+    if select == 'binned':
+        return f'oracle_binned_k{bon_n}_w{int(num_bins)}'
     resolved_tau = (horizon - 1) if tau is None else int(tau)
     return f'oracle_binary_k{bon_n}_tau{resolved_tau}'
 
@@ -275,6 +324,7 @@ def rollout_oracle_lookahead(
     select: str = 'distance',
     horizon: int = 1,
     tau: int | None = None,
+    num_bins: int = 5,
     tiebreak_seed: int = 0,
 ):
     import jax
@@ -301,6 +351,11 @@ def rollout_oracle_lookahead(
             pick = select_oracle_binary(
                 probe_env, oracle_env, oracle, mjstate, goal_xyz, candidates,
                 max_oracle_steps, warmup_steps, horizon, tau, rng,
+            )
+        elif select == 'binned':
+            pick = select_oracle_binned(
+                probe_env, oracle_env, oracle, mjstate, goal_xyz, candidates,
+                max_oracle_steps, warmup_steps, horizon, num_bins, rng,
             )
         else:
             pick = select_oracle_lookahead(
@@ -330,6 +385,7 @@ def _run_batch(
     gpu_id: int | None,
     select: str,
     tau: int | None,
+    num_bins: int,
 ) -> list[tuple[int, tuple[bool, int], tuple[bool, int]]]:
     if jax_platform == 'gpu' and gpu_id is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -409,6 +465,7 @@ def _run_batch(
             select=select,
             horizon=chunk_size,
             tau=tau,
+            num_bins=num_bins,
             tiebreak_seed=policy_seed + 17,
         )
         out.append((int(ep), bc, lookahead))
@@ -439,6 +496,7 @@ def parallel_evaluate(
     worker_gpu_ids: list[int],
     select: str,
     tau: int | None,
+    num_bins: int,
 ) -> tuple[list[tuple[bool, int]], list[tuple[bool, int]]]:
     episode_splits = np.array_split(np.arange(num_episodes), num_workers)
     merged: list[tuple[int, tuple[bool, int], tuple[bool, int]]] = []
@@ -465,6 +523,7 @@ def parallel_evaluate(
                 worker_gpu_ids[wid] if worker_gpu_ids else None,
                 select,
                 tau,
+                num_bins,
             )
             for wid, split in enumerate(episode_splits)
             if len(split) > 0
@@ -512,15 +571,25 @@ def main():
     p.add_argument('--bon_n', type=int, default=8, help='Number of action-chunk candidates (K)')
     p.add_argument(
         '--select',
-        choices=['distance', 'binary'],
+        choices=['distance', 'binary', 'binned'],
         default='distance',
-        help='distance: argmin d(s\'); binary: uniform among max progress label',
+        help=(
+            'distance: argmin d(s\'); '
+            'binary: uniform among max progress label; '
+            'binned: uniform among max signed Δ-bin label'
+        ),
     )
     p.add_argument(
         '--tau',
         type=int,
         default=None,
         help='(--select binary) slack; y=1 iff d(s)-d(s\') >= H-tau. Default tau=H-1',
+    )
+    p.add_argument(
+        '--num_bins',
+        type=int,
+        default=5,
+        help='(--select binned) odd number of equal pieces of [-H,H]; end bins absorb tails',
     )
     p.add_argument('--max_oracle_steps', type=int, default=200)
     p.add_argument('--warmup_steps', type=int, default=2)
@@ -541,6 +610,9 @@ def main():
 
     if args.egl_device is not None:
         os.environ['MUJOCO_EGL_DEVICE_ID'] = str(args.egl_device)
+
+    if args.select == 'binned' and (args.num_bins < 1 or args.num_bins % 2 == 0):
+        p.error(f'--num_bins must be odd and >= 1, got {args.num_bins}')
 
     jax_platform, num_workers, worker_gpu_ids = _resolve_parallel_config(
         args.jax_platform, args.num_workers, args.jax_device
@@ -564,7 +636,7 @@ def main():
         resolved_tau = chunk_size - 1
     else:
         resolved_tau = int(args.tau)
-    la_name = method_name(args.select, args.bon_n, args.tau, chunk_size)
+    la_name = method_name(args.select, args.bon_n, args.tau, chunk_size, args.num_bins)
 
     randomize_resets = not args.fixed_seeds
     reset_mode = (
@@ -573,11 +645,16 @@ def main():
         else f'fixed reset_seeds={args.reset_seed}..{args.reset_seed + args.num_episodes - 1}'
     )
 
-    select_desc = (
-        f'select=distance (argmin d)'
-        if args.select == 'distance'
-        else f'select=binary tau={resolved_tau} thr={chunk_size - resolved_tau}'
-    )
+    bin_width = (2.0 * chunk_size) / args.num_bins
+    if args.select == 'distance':
+        select_desc = 'select=distance (argmin d)'
+    elif args.select == 'binary':
+        select_desc = f'select=binary tau={resolved_tau} thr={chunk_size - resolved_tau}'
+    else:
+        select_desc = (
+            f'select=binned w={args.num_bins} s={bin_width:g} '
+            f'labels=[-{args.num_bins // 2}..+{args.num_bins // 2}]'
+        )
     print(
         f'env={env_name} task_id={args.task_id} ({task_name}) '
         f'max_steps={max_steps} chunk_size={chunk_size} K={args.bon_n} '
@@ -596,6 +673,7 @@ def main():
             'task_name': task_name,
             'resolved_tau': resolved_tau,
             'progress_threshold': chunk_size - resolved_tau if args.select == 'binary' else None,
+            'bin_width': bin_width if args.select == 'binned' else None,
             'la_name': la_name,
         },
     )
@@ -619,6 +697,7 @@ def main():
         worker_gpu_ids,
         args.select,
         args.tau,
+        args.num_bins,
     )
 
     print(f'episodes={args.num_episodes}')
@@ -630,6 +709,7 @@ def main():
         'lookahead/success_rate': la_row['success_rate'],
         'task_id': args.task_id,
         'tau': resolved_tau,
+        'num_bins': args.num_bins,
         'bon_n': args.bon_n,
         'select': args.select,
     })

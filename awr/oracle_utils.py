@@ -43,6 +43,27 @@ def progress_label(d_t, d_next, horizon: int, tau: int | None = None) -> float:
     return 1.0 if (int(d_t) - int(d_next)) >= threshold else 0.0
 
 
+def delta_bin_label(delta: float, horizon: int, num_bins: int) -> float:
+    """Signed uniform bins of Δ over [-H, H]; odd num_bins; end bins absorb tails.
+
+    Splits [-H, H] into ``num_bins`` equal pieces of width s = 2H / num_bins:
+      i = clip(floor((Δ + H) / s), 0, num_bins - 1)
+      ℓ = i - (num_bins - 1) / 2
+
+    So ℓ ∈ {-(w-1)/2, ..., +(w-1)/2} with w = num_bins (must be odd).
+    """
+    h = int(horizon)
+    w = int(num_bins)
+    if h < 1:
+        raise ValueError(f'horizon must be >= 1, got {h}')
+    if w < 1 or w % 2 == 0:
+        raise ValueError(f'num_bins must be odd and >= 1, got {w}')
+    s = (2.0 * h) / w
+    i = int(np.floor((float(delta) + h) / s))
+    i = int(np.clip(i, 0, w - 1))
+    return float(i - (w - 1) / 2.0)
+
+
 def capture_sim_state(env):
     u = env.unwrapped
     return get_sim_state(u._model, u._data)
