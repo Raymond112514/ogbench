@@ -74,16 +74,30 @@ def create_actor(obs_dim, act_dim, hidden_dims=(512, 512, 512, 512), lr=3e-4, se
 def extract_awr(
     observations: np.ndarray,
     actions: np.ndarray,
-    advantage_fn,
-    epochs: int,
+    advantage_fn=None,
+    epochs: int = 10,
     batch_size: int = 256,
     alpha: float = 10.0,
     lr: float = 3e-4,
     hidden_dims=(512, 512, 512, 512),
     seed: int = 0,
     chunk_size: int = 4,
+    advantages: np.ndarray | None = None,
 ) -> dict:
-    """Train Gaussian actor with AWR for `epochs` passes over the dataset."""
+    """Train Gaussian actor with AWR for `epochs` passes over the dataset.
+
+    Provide either ``advantage_fn(obs, acts) -> adv`` or a precomputed
+    ``advantages`` array aligned with ``observations`` / ``actions``.
+    """
+    if advantages is None and advantage_fn is None:
+        raise ValueError('provide advantage_fn or advantages')
+    if advantages is not None:
+        advantages = np.asarray(advantages, np.float32)
+        if len(advantages) != len(observations):
+            raise ValueError(
+                f'advantages length {len(advantages)} != observations {len(observations)}'
+            )
+
     obs_dim = observations.shape[1]
     act_dim = actions.shape[1]
     model, state = create_actor(obs_dim, act_dim, hidden_dims=hidden_dims, lr=lr, seed=seed)
@@ -91,6 +105,14 @@ def extract_awr(
     rng = np.random.default_rng(seed)
     steps_per_epoch = max(1, n // batch_size)
     info = {}
+
+    def _batch_adv(idx):
+        if advantages is not None:
+            return np.asarray(advantages[idx], np.float32)
+        return np.asarray(
+            advantage_fn(np.asarray(observations[idx]), np.asarray(actions[idx])),
+            np.float32,
+        )
 
     @jax.jit
     def train_step(state, obs, acts, adv):
@@ -110,14 +132,14 @@ def extract_awr(
                 continue
             obs = jnp.asarray(observations[idx])
             acts = jnp.asarray(actions[idx])
-            adv = jnp.asarray(advantage_fn(np.asarray(observations[idx]), np.asarray(actions[idx])))
+            adv = jnp.asarray(_batch_adv(idx))
             state, info = train_step(state, obs, acts, adv)
 
     # Full-dataset effective weight stats for wandb.
     all_adv = []
     for s in range(0, n, batch_size):
         idx = np.arange(s, min(s + batch_size, n))
-        all_adv.append(np.asarray(advantage_fn(observations[idx], actions[idx]), dtype=np.float64))
+        all_adv.append(np.asarray(_batch_adv(idx), dtype=np.float64))
     all_adv = np.concatenate(all_adv, axis=0)
     metrics = {k: float(v) for k, v in info.items()}
     metrics.update(weight_stats(all_adv, alpha))
