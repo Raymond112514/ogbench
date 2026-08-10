@@ -205,6 +205,16 @@ def sample_action_chunks(
     return jnp.clip(x.reshape(num_samples, chunk_size, act_dim), -1.0, 1.0)
 
 
+def _rms(v, eps: float = 1e-6):
+    """Per-sample RMS over the last axis; keeps leading batch dims."""
+    return jnp.sqrt(jnp.mean(jnp.square(v), axis=-1, keepdims=True) + eps)
+
+
+def renorm_cfg_rms(v_cfg, v_ref, eps: float = 1e-6):
+    """Rescale guided velocity so RMS(v_cfg) matches RMS(v_ref) (usually v_uncond)."""
+    return v_cfg * (_rms(v_ref, eps) / _rms(v_cfg, eps))
+
+
 def sample_action_chunk(
     params,
     apply_fn,
@@ -220,6 +230,7 @@ def sample_action_chunk(
     cfg_weight=None,
     cfg_cond_advantage=1.0,
     advantage_null=ADVANTAGE_NULL,
+    cfg_renorm_rms: bool = False,
 ):
     use_cfg = cfg_weight is not None and advantage_condition
     if not use_cfg and not advantage_condition:
@@ -256,6 +267,8 @@ def sample_action_chunk(
             v_uncond = apply_fn(params, x, tau, cond_uncond)
             v_cond = apply_fn(params, x, tau, cond_cond)
             v = v_uncond + w * (v_cond - v_uncond)
+            if cfg_renorm_rms:
+                v = renorm_cfg_rms(v, v_uncond)
             x = x + dt * v
     else:
         adv = None

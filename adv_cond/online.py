@@ -234,6 +234,7 @@ def collect_adv_cond(
     seed: int,
     cfg_weight: float,
     cfg_cond_advantage: float,
+    cfg_renorm_rms: bool = False,
 ) -> tuple[dict, float]:
     """Collect with advantage-conditioned policy + CFG (request high A)."""
     import jax
@@ -270,6 +271,7 @@ def collect_adv_cond(
                     advantage_condition=True,
                     cfg_weight=cfg_weight,
                     cfg_cond_advantage=cfg_cond_advantage,
+                    cfg_renorm_rms=cfg_renorm_rms,
                 )
             )
             for a in chunk:
@@ -312,10 +314,12 @@ def evaluate_cfg(
     n_flow_steps: int,
     cfg_weight: float,
     cfg_cond_advantage: float,
+    cfg_renorm_rms: bool = False,
 ) -> float:
     _, sr = collect_adv_cond(
         env, params, apply_fn, meta, task_id, num_episodes, n_flow_steps, max_steps, seed,
         cfg_weight=cfg_weight, cfg_cond_advantage=cfg_cond_advantage,
+        cfg_renorm_rms=cfg_renorm_rms,
     )
     return sr
 
@@ -405,6 +409,11 @@ def main():
                    help='CFG weight when collecting with adv-cond policy (rounds > 0)')
     p.add_argument('--cfg_cond_advantage', type=float, default=1.0,
                    help='Requested advantage at collect/eval (binary positive = 1)')
+    p.add_argument(
+        '--cfg_renorm_rms',
+        action='store_true',
+        help='After CFG, rescale v so RMS(v)=RMS(v_uncond) (collect + eval)',
+    )
     p.add_argument('--num_workers', type=int, default=10)
     p.add_argument('--max_oracle_steps', type=int, default=200)
     p.add_argument('--warmup_steps', type=int, default=2)
@@ -477,7 +486,7 @@ def main():
         f'AdvCond | env={env_name} task={args.task_id} ({task_name}) '
         f'chunk={chunk_size} tau={tau} thr={chunk_size - tau} '
         f'rounds={args.rounds} eps/round={args.episodes_per_round} '
-        f'cfg_dropout={args.cfg_dropout}'
+        f'cfg_dropout={args.cfg_dropout} cfg_renorm_rms={args.cfg_renorm_rms}'
     )
 
     buffers: list[dict] = []
@@ -498,8 +507,10 @@ def main():
                 args.n_flow_steps, max_steps, args.seed + 1000 + k,
                 cfg_weight=args.collect_cfg_weight,
                 cfg_cond_advantage=args.cfg_cond_advantage,
+                cfg_renorm_rms=args.cfg_renorm_rms,
             )
-            collect_mode = f'adv_cond_cfg{args.collect_cfg_weight}'
+            renorm_tag = '_rms' if args.cfg_renorm_rms else ''
+            collect_mode = f'adv_cond_cfg{args.collect_cfg_weight}{renorm_tag}'
 
         print(f'round {k}: collect={collect_mode} success={collect_sr:.3f}', flush=True)
 
@@ -602,6 +613,7 @@ def main():
                 env, params, apply_fn, meta, args.task_id, args.eval_episodes,
                 max_steps, args.seed + 10_000 + k * 100 + int(w * 100),
                 args.n_flow_steps, cfg_weight=w, cfg_cond_advantage=args.cfg_cond_advantage,
+                cfg_renorm_rms=args.cfg_renorm_rms,
             )
             key = f'eval/cfg_{w:g}'
             log[key] = sr
