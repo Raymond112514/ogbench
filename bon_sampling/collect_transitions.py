@@ -93,6 +93,7 @@ def collect_rollout(
     goal_condition: bool,
     record_frames: bool = False,
     bon=None,
+    action_fn=None,
 ):
     import jax.numpy as jnp
 
@@ -115,7 +116,9 @@ def collect_rollout(
         import jax
 
         key, sample_key = jax.random.split(key)
-        if bon is None:
+        if action_fn is not None:
+            chunk = np.asarray(action_fn(jnp.asarray(ob), sample_key))
+        elif bon is None:
             chunk = np.asarray(
                 sample_action_chunk(
                     params,
@@ -172,6 +175,9 @@ def _run_batch(
     advantage_ckpt: str | None,
     advantage_mode: str,
     bon_n: int,
+    select_mode: str = 'bon',
+    q_ascent_steps: int = 10,
+    q_ascent_lr: float = 0.1,
 ) -> list[dict]:
     if jax_platform == 'gpu' and gpu_id is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -195,28 +201,37 @@ def _run_batch(
     goal_condition = meta['goal_condition']
 
     bon = None
+    action_fn = None
     if advantage_ckpt is not None:
         import pickle
 
-        from bon_sampling.advantage.eval import _make_sample_candidates_fn
-
         with open(advantage_ckpt, 'rb') as f:
             ckpt_meta = pickle.load(f)
-        sample_candidates_fn = _make_sample_candidates_fn(
-            model.apply, bon_n, chunk_size, act_dim, n_flow_steps, goal_condition
-        )
-        if ckpt_meta.get('mode') == 'iql':
-            from bon_sampling.iql.train import load_iql, make_select_fn
+        if ckpt_meta.get('mode') == 'iql' and select_mode == 'q_ascent':
+            from bon_sampling.iql.train import load_iql, make_q_ascent_fn
 
             agent, _ = load_iql(advantage_ckpt)
-            select_fn = make_select_fn(agent)
-            bon = (sample_candidates_fn, select_fn, agent.network.params)
+            action_fn = make_q_ascent_fn(
+                agent, chunk_size, act_dim, n_steps=q_ascent_steps, lr=q_ascent_lr,
+            )
         else:
-            from bon_sampling.advantage.eval import _load_advantage, _make_select_fn
+            from bon_sampling.advantage.eval import _make_sample_candidates_fn
 
-            adv_model, adv_params, adv_mode, _ = _load_advantage(advantage_ckpt, advantage_mode)
-            select_fn = _make_select_fn(adv_model, adv_mode)
-            bon = (sample_candidates_fn, select_fn, adv_params)
+            sample_candidates_fn = _make_sample_candidates_fn(
+                model.apply, bon_n, chunk_size, act_dim, n_flow_steps, goal_condition
+            )
+            if ckpt_meta.get('mode') == 'iql':
+                from bon_sampling.iql.train import load_iql, make_select_fn
+
+                agent, _ = load_iql(advantage_ckpt)
+                select_fn = make_select_fn(agent)
+                bon = (sample_candidates_fn, select_fn, agent.network.params)
+            else:
+                from bon_sampling.advantage.eval import _load_advantage, _make_select_fn
+
+                adv_model, adv_params, adv_mode, _ = _load_advantage(advantage_ckpt, advantage_mode)
+                select_fn = _make_select_fn(adv_model, adv_mode)
+                bon = (sample_candidates_fn, select_fn, adv_params)
 
     env = gymnasium.make(env_name)
     results: list[dict] = []
@@ -236,6 +251,7 @@ def _run_batch(
             goal_condition,
             record_frames=record_frames,
             bon=bon,
+            action_fn=action_fn,
         )
         results.append(
             {
@@ -271,6 +287,9 @@ def parallel_collect(
     advantage_ckpt: str | None = None,
     advantage_mode: str = 'auto',
     bon_n: int = 8,
+    select_mode: str = 'bon',
+    q_ascent_steps: int = 10,
+    q_ascent_lr: float = 0.1,
 ) -> tuple[list, list, list, list, list, list, list, list, list]:
     episode_splits = np.array_split(np.arange(num_rollouts), num_workers)
     merged: list[dict] = []
@@ -292,6 +311,9 @@ def parallel_collect(
                 advantage_ckpt,
                 advantage_mode,
                 bon_n,
+                select_mode,
+                q_ascent_steps,
+                q_ascent_lr,
             )
             for wid, split in enumerate(episode_splits)
             if len(split) > 0

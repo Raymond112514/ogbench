@@ -64,6 +64,44 @@ def make_select_fn(agent: IQLAgent):
     return select_chunk
 
 
+def make_q_ascent_fn(
+    agent: IQLAgent,
+    chunk_size: int,
+    act_dim: int,
+    n_steps: int = 10,
+    lr: float = 0.1,
+):
+    """Sample Uniform[-1,1] noise, then ascend min(Q1,Q2) for n_steps."""
+    import jax
+    import jax.numpy as jnp
+
+    apply_fn = agent.network.apply_fn
+    params = agent.network.params
+    flat_dim = int(chunk_size) * int(act_dim)
+    n_steps = int(n_steps)
+    lr = float(lr)
+
+    def q_scalar(flat_action, observation):
+        obs = observation[None]
+        acts = flat_action[None]
+        q1, q2 = apply_fn({'params': params}, obs, actions=acts, name='critic')
+        return jnp.minimum(q1, q2).reshape(())
+
+    @jax.jit
+    def optimize(observation, rng):
+        action = jax.random.uniform(rng, (flat_dim,), minval=-1.0, maxval=1.0)
+
+        def step(action, _):
+            grad = jax.grad(q_scalar)(action, observation)
+            action = jnp.clip(action + lr * grad, -1.0, 1.0)
+            return action, None
+
+        action, _ = jax.lax.scan(step, action, None, length=n_steps)
+        return action.reshape(chunk_size, act_dim)
+
+    return optimize
+
+
 def train_iql(
     data_paths: list[str | Path],
     ckpt_path: str | Path,

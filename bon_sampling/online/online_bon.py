@@ -1,18 +1,25 @@
 """Online BoN loop: collect -> fit reranker, logging to wandb.
 
 --method classifier: oracle-label, then fit classifier on all annotated data so far.
+  Later rounds collect with BoN using the previous classifier.
 --method iql: no oracle; fit FQL IQL on all rollouts so far using env success (-1/0).
+  After each fit, eval by sampling Uniform[-1,1] action noise and running gradient
+  ascent on min(Q1,Q2) for a few steps (not BoN). Logs to wandb project bon-iql.
 
-Round 0 always collects with the plain GCBC policy. Later rounds use BoN with the previous
-round's reranker. Data collection always runs on CPU (--num_workers parallel envs).
+Round 0 always collects with the plain GCBC policy. Data collection always runs on
+CPU (--num_workers parallel envs).
 
 No persistent checkpoints or rollout dumps — only temp files for BoN workers / labeling.
-Each round also logs classifier accuracy / precision / recall on ~20 fresh oracle-labeled
+Each classifier round also logs accuracy / precision / recall on ~20 fresh oracle-labeled
 episodes (held-out from training).
 
 python bon_sampling/online/online_bon.py \\
   --checkpoint flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl \\
   --method classifier --rounds 30 --episodes_per_round 100 --num_workers 10 --device cpu
+
+python bon_sampling/online/online_bon.py \\
+  --checkpoint flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl \\
+  --method iql --rounds 1 --episodes_per_round 200 --eval_episodes 50
 """
 
 from __future__ import annotations
@@ -33,7 +40,20 @@ if sys.platform.startswith('linux'):
     os.environ.setdefault('MUJOCO_GL', 'egl')
 
 
-def collect_round(checkpoint, env_name, task_id, n_episodes, num_workers, n_flow_steps, reranker_ckpt, bon_n, out_path):
+def collect_round(
+    checkpoint,
+    env_name,
+    task_id,
+    n_episodes,
+    num_workers,
+    n_flow_steps,
+    reranker_ckpt,
+    bon_n,
+    out_path,
+    select_mode: str = 'bon',
+    q_ascent_steps: int = 10,
+    q_ascent_lr: float = 0.1,
+):
     import gymnasium
 
     import ogbench.manipspace  # noqa: F401
@@ -50,6 +70,9 @@ def collect_round(checkpoint, env_name, task_id, n_episodes, num_workers, n_flow
     obs, act, next_obs, state, step_succ, ends, successes, _, init_state = ct.parallel_collect(
         checkpoint, env_name, task_id, n_episodes, num_workers, max_steps, n_flow_steps,
         None, 'cpu', [], reranker_ckpt, 'auto', bon_n,
+        select_mode=select_mode,
+        q_ascent_steps=q_ascent_steps,
+        q_ascent_lr=q_ascent_lr,
     )
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +88,10 @@ def collect_round(checkpoint, env_name, task_id, n_episodes, num_workers, n_flow
         task_id=np.array(task_id),
         episode_ends=np.asarray(ends, np.int32),
         chunk_size=np.array(meta['chunk_size']),
-        policy='bon' if reranker_ckpt else 'flow_bc',
+        policy=(
+            'q_ascent' if reranker_ckpt and select_mode == 'q_ascent'
+            else ('bon' if reranker_ckpt else 'flow_bc')
+        ),
     )
     return float(np.mean(successes)), len(act), int(meta['chunk_size'])
 
@@ -247,6 +273,16 @@ def main():
     p.add_argument('--episodes_per_round', type=int, default=100)
     p.add_argument('--eval_clf_episodes', type=int, default=20,
                    help='Fresh episodes for held-out classifier metrics each round')
+    p.add_argument(
+        '--eval_episodes',
+        type=int,
+        default=50,
+        help='(--method iql) Q-ascent eval episodes after each IQL fit',
+    )
+    p.add_argument('--q_ascent_steps', type=int, default=10,
+                   help='(--method iql) gradient-ascent steps on Q')
+    p.add_argument('--q_ascent_lr', type=float, default=0.1,
+                   help='(--method iql) action step size for Q ascent')
     p.add_argument('--num_workers', type=int, default=10)
     p.add_argument('--bon_n', type=int, default=8)
     p.add_argument('--max_oracle_steps', type=int, default=200)
@@ -263,7 +299,11 @@ def main():
     p.add_argument('--expectile', type=float, default=0.9, help='IQL expectile (ignored for classifier)')
     p.add_argument('--device', choices=['cpu', 'auto'], default='cpu',
                    help='JAX backend for training; data collection is always CPU')
-    p.add_argument('--wandb_project', default='bon-online')
+    p.add_argument(
+        '--wandb_project',
+        default=None,
+        help='Default: bon-iql if --method iql, else bon-online',
+    )
     p.add_argument('--wandb_name', default=None, help='Wandb run name')
     p.add_argument('--wandb_mode', choices=['online', 'offline', 'disabled'], default='online')
     args = p.parse_args()
@@ -275,11 +315,14 @@ def main():
 
     import wandb
 
+    wandb_project = args.wandb_project or (
+        'bon-iql' if args.method == 'iql' else 'bon-online'
+    )
     wandb.init(
-        project=args.wandb_project,
+        project=wandb_project,
         name=args.wandb_name,
         mode=args.wandb_mode,
-        config=vars(args),
+        config={**vars(args), 'wandb_project': wandb_project},
     )
 
     reranker_ckpt = None
@@ -294,9 +337,11 @@ def main():
             raw_path = round_dir / 'rollouts.npz'
             annotated_path = round_dir / 'annotated.npz'
 
+            # IQL training data is always plain GCBC; Q-ascent is eval-only.
+            collect_ckpt = None if args.method == 'iql' else reranker_ckpt
             success_rate, num_transitions, chunk_size = collect_round(
                 args.checkpoint, args.env_name, args.task_id, args.episodes_per_round, args.num_workers,
-                args.n_flow_steps, reranker_ckpt, args.bon_n, raw_path,
+                args.n_flow_steps, collect_ckpt, args.bon_n, raw_path,
             )
 
             log = {
@@ -345,7 +390,24 @@ def main():
                     train_paths, reranker_path, args.train_steps, seed=args.seed,
                     batch_size=args.batch_size, chunk_size=chunk_size, expectile=args.expectile,
                 )
-                print(f'round {r} [iql]: success_rate={success_rate:.3f}', flush=True)
+                eval_path = round_dir / 'q_ascent_eval.npz'
+                eval_sr, eval_trans, _ = collect_round(
+                    args.checkpoint, args.env_name, args.task_id, args.eval_episodes,
+                    args.num_workers, args.n_flow_steps, ckpt_path, args.bon_n, eval_path,
+                    select_mode='q_ascent',
+                    q_ascent_steps=args.q_ascent_steps,
+                    q_ascent_lr=args.q_ascent_lr,
+                )
+                log['eval/success_rate'] = eval_sr
+                log['eval/num_transitions'] = eval_trans
+                log['eval/mode'] = 'q_ascent'
+                log['eval/q_ascent_steps'] = args.q_ascent_steps
+                log['eval/q_ascent_lr'] = args.q_ascent_lr
+                print(
+                    f'round {r} [iql]: collect={success_rate:.3f} '
+                    f'q_ascent_eval={eval_sr:.3f} (steps={args.q_ascent_steps}, lr={args.q_ascent_lr})',
+                    flush=True,
+                )
 
             log['train/num_datasets'] = len(train_paths)
             log.update({f'train/{k}': v for k, v in metrics.items()})
