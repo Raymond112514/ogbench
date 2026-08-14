@@ -1,7 +1,10 @@
 """Online BoN loop: collect -> fit reranker, logging to wandb.
 
---method classifier: oracle-label, then fit classifier on all annotated data so far.
-  Later rounds collect with BoN using the previous classifier.
+--method classifier: oracle-label, then fit binary progress classifier on all
+  annotated data so far. Later rounds collect with BoN using that classifier.
+--method bin_classifier: oracle-label Δ into ``num_bins`` signed bins on [-H,H],
+  fit a softmax classifier, and BoN-rank by expected bin label
+  A = Σ_i p(ℓ_i|s,a) ℓ_i. Sweep --num_bins (odd).
 --method iql: no oracle; fit FQL IQL on all rollouts so far using env success (-1/0).
   After each fit, eval by sampling Uniform[-1,1] action noise and running gradient
   ascent on min(Q1,Q2) for a few steps (not BoN). Logs to wandb project bon-iql.
@@ -10,12 +13,16 @@ Round 0 always collects with the plain GCBC policy. Data collection always runs 
 CPU (--num_workers parallel envs).
 
 No persistent checkpoints or rollout dumps — only temp files for BoN workers / labeling.
-Each classifier round also logs accuracy / precision / recall on ~20 fresh oracle-labeled
-episodes (held-out from training).
+Each classifier round also logs metrics on ~20 fresh oracle-labeled episodes
+(held-out from training).
 
 python bon_sampling/online/online_bon.py \\
   --checkpoint flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl \\
   --method classifier --rounds 30 --episodes_per_round 100 --num_workers 10 --device cpu
+
+python bon_sampling/online/online_bon.py \\
+  --checkpoint flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl \\
+  --method bin_classifier --num_bins 5 --rounds 30 --episodes_per_round 100
 
 python bon_sampling/online/online_bon.py \\
   --checkpoint flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl \\
@@ -177,6 +184,83 @@ def train_classifier(data_path, ckpt_path, steps, batch_size, lr, hidden, val_ra
     return str(ckpt_path), {'val_acc': best_val_acc, 'val_loss': best_val_loss}
 
 
+def train_bin_classifier(
+    data_path, ckpt_path, steps, batch_size, lr, hidden, val_ratio, seed, eval_interval, num_bins,
+):
+    """Fit softmax Δ-bin classifier; BoN uses E[ℓ]. Temp pickle for workers only."""
+    import pickle
+
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from flax.training import train_state
+    from tqdm import trange
+
+    from bon_sampling.advantage.dataset import make_train_val
+    from bon_sampling.advantage.model import AdvantageBinClassifier
+    from bon_sampling.advantage.train import eval_dataset_bins, sample_batch, train_step_bins
+
+    train_data, val_data = make_train_val(
+        str(data_path), val_ratio, seed, task='bin_classifier', num_bins=num_bins,
+    )
+    chunk_size = train_data.chunk_size if train_data.chunk_mode else 1
+    obs_dim = train_data.observations.shape[1]
+    act_dim = train_data.act_dim
+    w = int(num_bins)
+
+    model = AdvantageBinClassifier(hidden=hidden, num_bins=w)
+    key = jax.random.PRNGKey(seed)
+    params = model.init(key, jnp.zeros((1, obs_dim)), jnp.zeros((1, act_dim)))
+    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(lr))
+
+    rng = np.random.default_rng(seed)
+    best_val_acc, best_val_loss, best_val_mae = -1.0, 0.0, 0.0
+    best_params = state.params
+    best_step = 0
+    for step in trange(1, steps + 1, desc=f'train bin-clf w={w}'):
+        batch = sample_batch(train_data, batch_size, rng)
+        batch = {
+            'observations': jnp.asarray(batch['observations']),
+            'actions': jnp.asarray(batch['actions']),
+            'labels': jnp.asarray(batch['labels'], dtype=jnp.int32),
+        }
+        state, _ = train_step_bins(state, batch)
+        if step % eval_interval == 0 or step == steps:
+            val_m = eval_dataset_bins(state, val_data, batch_size)
+            if val_m.get('accuracy', 0.0) > best_val_acc:
+                best_val_acc = val_m['accuracy']
+                best_val_loss = val_m['loss']
+                best_val_mae = val_m.get('expected_mae', 0.0)
+                best_params, best_step = state.params, step
+
+    train_mass = train_data.class_mass()
+    Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(ckpt_path, 'wb') as f:
+        pickle.dump(
+            {
+                'mode': 'bin_classifier',
+                'step': best_step,
+                'params': best_params,
+                'obs_dim': obs_dim,
+                'act_dim': act_dim,
+                'chunk_size': chunk_size,
+                'hidden': hidden,
+                'num_bins': w,
+            },
+            f,
+        )
+    metrics = {
+        'val_acc': best_val_acc,
+        'val_loss': best_val_loss,
+        'val_expected_mae': best_val_mae,
+        'num_bins': float(w),
+    }
+    for i, p_i in enumerate(train_mass):
+        ell = i - (w - 1) / 2.0
+        metrics[f'train_mass/ell_{ell:g}'] = float(p_i)
+    return str(ckpt_path), metrics
+
+
 def _prf(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     y_true = np.asarray(y_true).astype(np.float32).reshape(-1)
     y_pred = np.asarray(y_pred).astype(np.float32).reshape(-1)
@@ -262,10 +346,81 @@ def eval_classifier_fresh(
     return _prf(y_true, y_pred)
 
 
+def eval_bin_classifier_fresh(
+    policy_ckpt: str,
+    env_name: str,
+    task_id: int,
+    n_episodes: int,
+    num_workers: int,
+    n_flow_steps: int,
+    bon_n: int,
+    classifier_ckpt: str,
+    max_oracle_steps: int,
+    warmup_steps: int,
+    batch_size: int,
+    tmp_dir: Path,
+    num_bins: int,
+) -> dict[str, float]:
+    """Collect fresh GCBC episodes; score bin-clf accuracy and E[ℓ] MAE."""
+    import pickle
+
+    import jax.numpy as jnp
+
+    from bon_sampling.advantage.dataset import AdvantageDataset
+    from bon_sampling.advantage.model import AdvantageBinClassifier, expected_bin_advantage
+
+    raw_path = tmp_dir / 'eval_fresh_raw.npz'
+    ann_path = tmp_dir / 'eval_fresh_annotated.npz'
+
+    collect_round(
+        policy_ckpt, env_name, task_id, n_episodes, num_workers, n_flow_steps,
+        None, bon_n, raw_path,
+    )
+    annotate_round(raw_path, ann_path, num_workers, max_oracle_steps, warmup_steps)
+
+    data = AdvantageDataset(
+        str(ann_path), episode_ids=None, task='bin_classifier', num_bins=num_bins,
+    )
+    if len(data) == 0:
+        return {
+            'accuracy': 0.0, 'expected_mae': 0.0, 'num_samples': 0.0,
+        }
+
+    with open(classifier_ckpt, 'rb') as f:
+        ckpt = pickle.load(f)
+    w = int(ckpt['num_bins'])
+    model = AdvantageBinClassifier(hidden=ckpt['hidden'], num_bins=w)
+    params = ckpt['params']
+
+    accs, maes, n = [], [], 0
+    for start in range(0, len(data), batch_size):
+        sel = np.arange(start, min(start + batch_size, len(data)))
+        batch = data.get_batch(sel)
+        logits = model.apply(
+            params,
+            jnp.asarray(batch['observations']),
+            jnp.asarray(batch['actions']),
+        )
+        logits_np = np.asarray(logits)
+        labels = np.asarray(batch['labels'], dtype=np.int32)
+        pred = np.argmax(logits_np, axis=-1)
+        ell_true = labels.astype(np.float32) - (w - 1) / 2.0
+        ell_hat = np.asarray(expected_bin_advantage(jnp.asarray(logits_np)))
+        accs.append(float(np.mean(pred == labels)) * len(labels))
+        maes.append(float(np.mean(np.abs(ell_hat - ell_true))) * len(labels))
+        n += len(labels)
+
+    return {
+        'accuracy': (sum(accs) / n) if n else 0.0,
+        'expected_mae': (sum(maes) / n) if n else 0.0,
+        'num_samples': float(n),
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--checkpoint', default='flow_bc/checkpoints/cube_single_gcbc_ac10/best.pkl')
-    p.add_argument('--method', choices=['classifier', 'iql'], default='classifier')
+    p.add_argument('--method', choices=['classifier', 'bin_classifier', 'iql'], default='classifier')
     p.add_argument('--env_name', default='cube-single-v0')
     p.add_argument('--task_id', type=int, default=1)
     p.add_argument('--n_flow_steps', type=int, default=10)
@@ -289,6 +444,8 @@ def main():
     p.add_argument('--warmup_steps', type=int, default=2)
     p.add_argument('--tau', type=int, default=None,
                    help='Progress slack: y=1 iff d(s)-d(s\') >= H-tau. Default tau=H-1 (threshold 1)')
+    p.add_argument('--num_bins', type=int, default=5,
+                   help='(--method bin_classifier) odd # of equal pieces of [-H,H]')
     p.add_argument('--train_steps', type=int, default=5000)
     p.add_argument('--batch_size', type=int, default=256)
     p.add_argument('--lr', type=float, default=3e-4)
@@ -302,11 +459,14 @@ def main():
     p.add_argument(
         '--wandb_project',
         default=None,
-        help='Default: bon-iql if --method iql, else bon-online',
+        help='Default: bon-iql / ogbench_bon_sweep_bins / bon-online',
     )
     p.add_argument('--wandb_name', default=None, help='Wandb run name')
     p.add_argument('--wandb_mode', choices=['online', 'offline', 'disabled'], default='online')
     args = p.parse_args()
+
+    if args.method == 'bin_classifier' and (args.num_bins < 1 or args.num_bins % 2 == 0):
+        p.error(f'--num_bins must be odd and >= 1, got {args.num_bins}')
 
     if args.device == 'cpu':
         os.environ['JAX_PLATFORMS'] = 'cpu'
@@ -316,7 +476,8 @@ def main():
     import wandb
 
     wandb_project = args.wandb_project or (
-        'bon-iql' if args.method == 'iql' else 'bon-online'
+        'bon-iql' if args.method == 'iql'
+        else ('ogbench_bon_sweep_bins' if args.method == 'bin_classifier' else 'bon-online')
     )
     wandb.init(
         project=wandb_project,
@@ -380,6 +541,36 @@ def main():
                     f'round {r} [classifier]: success={success_rate:.3f} '
                     f'clf_acc={clf_m["accuracy"]:.3f} prec={clf_m["precision"]:.3f} '
                     f'recall={clf_m["recall"]:.3f} (n={int(clf_m["num_samples"])})',
+                    flush=True,
+                )
+            elif args.method == 'bin_classifier':
+                mean_distance = annotate_round(
+                    raw_path, annotated_path, args.num_workers, args.max_oracle_steps, args.warmup_steps
+                )
+                train_paths.append(annotated_path)
+                from bon_sampling.advantage.dataset import merge_annotated
+
+                merged = tmp_dir / 'annotated_all.npz'
+                merge_annotated([str(p) for p in train_paths], str(merged))
+                ckpt_path, metrics = train_bin_classifier(
+                    merged, reranker_path, args.train_steps, args.batch_size, args.lr, args.hidden,
+                    args.val_ratio, args.seed, args.eval_interval, args.num_bins,
+                )
+                log['collect/mean_oracle_distance'] = mean_distance
+                log['label/num_bins'] = args.num_bins
+                log['label/bin_width'] = (2.0 * chunk_size) / args.num_bins
+
+                clf_m = eval_bin_classifier_fresh(
+                    args.checkpoint, args.env_name, args.task_id, args.eval_clf_episodes,
+                    args.num_workers, args.n_flow_steps, args.bon_n, ckpt_path,
+                    args.max_oracle_steps, args.warmup_steps, args.batch_size, tmp_dir,
+                    args.num_bins,
+                )
+                log.update({f'eval_clf/{k}': v for k, v in clf_m.items()})
+                print(
+                    f'round {r} [bin_classifier w={args.num_bins}]: success={success_rate:.3f} '
+                    f'acc={clf_m["accuracy"]:.3f} E[l]-mae={clf_m["expected_mae"]:.3f} '
+                    f'(n={int(clf_m["num_samples"])})',
                     flush=True,
                 )
             else:

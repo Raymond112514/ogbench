@@ -54,6 +54,31 @@ def build_samples(
     return np.asarray(indices, np.int64), np.asarray(labels, np.float32)
 
 
+def build_bin_samples(
+    episode_ends: np.ndarray,
+    distance: np.ndarray,
+    chunk_mode: bool,
+    horizon: int,
+    num_bins: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build (index, class) pairs: class = Δ-bin index in {0, ..., w-1}."""
+    from awr.oracle_utils import delta_bin_index
+
+    h = int(horizon) if chunk_mode else 1
+    indices = []
+    labels = []
+    for start, end in episode_ranges(episode_ends):
+        if chunk_mode:
+            for t in range(start, end - 1):
+                indices.append(t)
+                labels.append(delta_bin_index(float(distance[t] - distance[t + 1]), h, num_bins))
+        else:
+            for t in range(start + 1, end):
+                indices.append(t)
+                labels.append(delta_bin_index(float(distance[t - 1] - distance[t]), 1, num_bins))
+    return np.asarray(indices, np.int64), np.asarray(labels, np.int32)
+
+
 def build_regression_samples(
     episode_ends: np.ndarray,
     distance: np.ndarray,
@@ -117,6 +142,7 @@ class AdvantageDataset:
         task: str = 'classifier',
         gamma: float = 0.99,
         tau: int | None = None,
+        num_bins: int = 5,
     ):
         self.data = np.load(path, mmap_mode='r')
         self.observations = self.data['observations']
@@ -127,6 +153,7 @@ class AdvantageDataset:
         self.task = task
         self.gamma = gamma
         self.tau = self.chunk_size - 1 if tau is None else int(tau)
+        self.num_bins = int(num_bins)
 
         if self.chunk_mode:
             chunks = self.data['action_chunks']
@@ -139,12 +166,19 @@ class AdvantageDataset:
                 self.episode_ends, self.distance, self.chunk_mode,
                 horizon=self.chunk_size, tau=self.tau,
             )
+        elif task == 'bin_classifier':
+            all_indices, all_labels = build_bin_samples(
+                self.episode_ends, self.distance, self.chunk_mode,
+                horizon=self.chunk_size, num_bins=self.num_bins,
+            )
         elif task == 'regression':
             all_indices, all_labels = build_regression_samples(
                 self.episode_ends, self.distance, self.chunk_mode, gamma
             )
         else:
-            raise ValueError(f'unknown task={task!r}; expected classifier or regression')
+            raise ValueError(
+                f'unknown task={task!r}; expected classifier, bin_classifier, or regression'
+            )
 
         if episode_ids is not None:
             allowed = set(mask_for_episodes(self.episode_ends, episode_ids, self.chunk_mode).tolist())
@@ -176,6 +210,13 @@ class AdvantageDataset:
             return 0.0, 0.0
         return float(np.mean(self.labels == 0)), float(np.mean(self.labels == 1))
 
+    def class_mass(self) -> np.ndarray:
+        w = int(self.num_bins)
+        if len(self.labels) == 0:
+            return np.zeros(w, dtype=np.float64)
+        counts = np.bincount(np.asarray(self.labels, np.int64), minlength=w).astype(np.float64)
+        return counts / counts.sum()
+
 
 def make_train_val(
     path: str,
@@ -184,13 +225,18 @@ def make_train_val(
     task: str = 'classifier',
     gamma: float = 0.99,
     tau: int | None = None,
+    num_bins: int = 5,
 ) -> tuple[AdvantageDataset, AdvantageDataset]:
     data = np.load(path, allow_pickle=False)
     num_episodes = len(data['episode_ends'])
     train_eps, val_eps = split_episodes(num_episodes, val_ratio, seed)
     return (
-        AdvantageDataset(path, train_eps, task=task, gamma=gamma, tau=tau),
-        AdvantageDataset(path, val_eps, task=task, gamma=gamma, tau=tau),
+        AdvantageDataset(
+            path, train_eps, task=task, gamma=gamma, tau=tau, num_bins=num_bins,
+        ),
+        AdvantageDataset(
+            path, val_eps, task=task, gamma=gamma, tau=tau, num_bins=num_bins,
+        ),
     )
 
 

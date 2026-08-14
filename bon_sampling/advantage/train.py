@@ -16,7 +16,7 @@ from flax.training import train_state
 from tqdm import trange
 
 from bon_sampling.advantage.dataset import make_train_val
-from bon_sampling.advantage.model import AdvantageClassifier
+from bon_sampling.advantage.model import AdvantageClassifier, expected_bin_advantage
 
 
 def bce_loss(logits, labels):
@@ -69,6 +69,56 @@ def eval_dataset(state, dataset, batch_size, rng):
         losses.append(float(m['loss']))
         accs.append(float(m['accuracy']))
     return {'loss': np.mean(losses), 'accuracy': np.mean(accs)}
+
+
+def softmax_ce_loss(logits, labels):
+    return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, labels))
+
+
+@jax.jit
+def train_step_bins(state, batch):
+    def loss_fn(params):
+        logits = state.apply_fn(params, batch['observations'], batch['actions'])
+        return softmax_ce_loss(logits, batch['labels'])
+
+    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    return state.apply_gradients(grads=grads), loss
+
+
+@jax.jit
+def eval_metrics_bins(state, observations, actions, labels):
+    logits = state.apply_fn(state.params, observations, actions)
+    preds = jnp.argmax(logits, axis=-1)
+    acc = jnp.mean((preds == labels).astype(jnp.float32))
+    loss = softmax_ce_loss(logits, labels)
+    ell_true = labels.astype(jnp.float32) - (logits.shape[-1] - 1) / 2.0
+    ell_hat = expected_bin_advantage(logits)
+    mae = jnp.mean(jnp.abs(ell_hat - ell_true))
+    return {'loss': loss, 'accuracy': acc, 'expected_mae': mae}
+
+
+def eval_dataset_bins(state, dataset, batch_size):
+    if len(dataset) == 0:
+        return {}
+    n = len(dataset)
+    losses, accs, maes = [], [], []
+    for start in range(0, n, batch_size):
+        sel = np.arange(start, min(start + batch_size, n))
+        batch = dataset.get_batch(sel)
+        m = eval_metrics_bins(
+            state,
+            jnp.asarray(batch['observations']),
+            jnp.asarray(batch['actions']),
+            jnp.asarray(batch['labels'], dtype=np.int32),
+        )
+        losses.append(float(m['loss']))
+        accs.append(float(m['accuracy']))
+        maes.append(float(m['expected_mae']))
+    return {
+        'loss': float(np.mean(losses)),
+        'accuracy': float(np.mean(accs)),
+        'expected_mae': float(np.mean(maes)),
+    }
 
 
 def save_checkpoint(path, state, obs_dim, act_dim, hidden, step, chunk_size=1):

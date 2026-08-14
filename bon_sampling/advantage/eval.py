@@ -180,12 +180,19 @@ def rollout_bon(
 def _load_advantage(checkpoint_path: str, advantage_mode: str):
     import jax
 
-    from bon_sampling.advantage.model import AdvantageClassifier, AdvantageRegressor
+    from bon_sampling.advantage.model import (
+        AdvantageBinClassifier,
+        AdvantageClassifier,
+        AdvantageRegressor,
+    )
 
     with open(checkpoint_path, 'rb') as f:
         ckpt = pickle.load(f)
     ckpt_mode = ckpt.get('mode', 'classifier')
     mode = ckpt_mode if advantage_mode == 'auto' else advantage_mode
+    if ckpt_mode == 'bin_classifier' or mode == 'bin_classifier':
+        model = AdvantageBinClassifier(hidden=ckpt['hidden'], num_bins=int(ckpt['num_bins']))
+        return model, ckpt['params'], 'bin_classifier', ckpt.get('chunk_size', 1)
     if mode == 'regression':
         model = AdvantageRegressor(hidden=ckpt['hidden'])
     else:
@@ -197,11 +204,15 @@ def _make_select_fn(model, mode: str):
     import jax
     import jax.numpy as jnp
 
+    from bon_sampling.advantage.model import expected_bin_advantage
+
     @jax.jit
     def select_chunk(params, observation, chunks):
         flat = chunks.reshape(chunks.shape[0], -1)
         obs = jnp.broadcast_to(observation[None], (flat.shape[0], observation.shape[0]))
         preds = model.apply(params, obs, flat)
+        if mode == 'bin_classifier':
+            return jnp.argmax(expected_bin_advantage(preds))
         if mode == 'regression':
             return jnp.argmax(preds)
         return jnp.argmax(jax.nn.sigmoid(preds))
@@ -417,7 +428,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--policy_ckpt', default='flow_bc/checkpoints/best.pkl')
     p.add_argument('--advantage_ckpt', default='bon_sampling/advantage/checkpoints/best.pkl')
-    p.add_argument('--advantage_mode', choices=('classifier', 'regression', 'auto'), default='auto')
+    p.add_argument('--advantage_mode', choices=('classifier', 'regression', 'bin_classifier', 'auto'), default='auto')
     p.add_argument('--n_flow_steps', type=int, default=10)
     p.add_argument('--env_name', default='cube-single-v0')
     p.add_argument('--task_id', type=int, default=1)

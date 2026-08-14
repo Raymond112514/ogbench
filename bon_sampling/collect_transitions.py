@@ -365,7 +365,7 @@ def main():
     )
     p.add_argument('--jax_device', type=int, default=None)
     p.add_argument('--advantage_ckpt', default=None, help='Classifier checkpoint; enables BoN action selection')
-    p.add_argument('--advantage_mode', choices=('classifier', 'regression', 'auto'), default='auto')
+    p.add_argument('--advantage_mode', choices=('classifier', 'regression', 'bin_classifier', 'auto'), default='auto')
     p.add_argument('--bon_n', type=int, default=8, help='Number of candidate chunks per BoN step')
     args = p.parse_args()
 
